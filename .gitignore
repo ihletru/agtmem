@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local scratch stores created by the test suite or by hand.
+# The real store lives in ~/.agtmem and must never end up in the repo.
+.agtmem/
+.mem/
+.testmem/
+.conctest/
+.repro/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Editors and OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
