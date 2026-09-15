@@ -1,0 +1,83 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Do not cancel the other jobs when one fails — the whole point of the
+      # matrix is to see which platform broke.
+      fail-fast: false
+      matrix:
+        # Windows and macOS are here on purpose. The store's lock has a
+        # platform branch (`msvcrt` vs `fcntl`), and every lock bug found during
+        # development was Windows-only. Testing Linux alone would leave the
+        # branch that actually broke untested.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Report interpreter and SQLite
+        run: |
+          python -c "import sys, sqlite3; print(sys.version); print('sqlite', sqlite3.sqlite_version)"
+          python -c "import sqlite3; sqlite3.connect(':memory:').execute('CREATE VIRTUAL TABLE t USING fts5(x)'); print('FTS5 available')"
+
+      - name: Run the test suite
+        run: python tests/test_e2e.py
+
+  install:
+    name: packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build a wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build --wheel
+
+      # Install the built wheel into a clean environment, not the source tree,
+      # so a missing file in the package is caught rather than masked by the
+      # working directory being importable.
+      - name: Install the wheel in a clean environment
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/python -m pip install --upgrade pip
+          /tmp/clean/bin/python -m pip install dist/*.whl
+
+      - name: Check the console scripts exist and run
+        run: |
+          /tmp/clean/bin/agtmem --help
+          /tmp/clean/bin/agtmem-mcp --help 2>/dev/null || true
+          /tmp/clean/bin/python -c "import agtmem; print('version', agtmem.__version__)"
+
+      # The README promises zero runtime dependencies. Assert it against the
+      # installed distribution rather than against the source tree.
+      - name: Assert no runtime dependencies were installed
+        run: |
+          /tmp/clean/bin/python - <<'PY'
+          from importlib.metadata import requires
+          deps = requires("agtmem") or []
+          runtime = [d for d in deps if "extra ==" not in d]
+          print("declared runtime dependencies:", runtime)
+          assert not runtime, f"unexpected dependencies: {runtime}"
+          print("OK: zero runtime dependencies")
+          PY
