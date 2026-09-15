@@ -77,6 +77,13 @@ assuming the design worked. Details and numbers in
   to promote a candidate that the first pass ranked low.
 - Added `agtmem-mcp`, a no-argument MCP entry point, so MCP clients can point at
   an executable instead of passing `["-m", "agtmem", "mcp"]` as arguments.
+- **Documented installation for specific agents** rather than only a generic
+  snippet: WorkBuddy AI (`~/.workbuddy-ai/mcp.json`, including the one-time
+  approval step), Hermes (`~/.hermes/config.yaml` under `mcp_servers:`, reload
+  with `/reload-mcp`), and Claude Desktop / Cursor / other JSON clients. Also
+  notes why the **full path** to the executable matters — most MCP clients spawn
+  servers without inheriting PATH, so a bare `agtmem-mcp` can work in your
+  terminal and still fail to start under the client.
 - **Claims about other products were overstated.** The README opened with "Every
   agent-memory product wants to be the place your memory lives" — four were
   examined, not all of them. Now "Most". The same review caught "No lexical trick

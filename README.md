@@ -137,6 +137,83 @@ other.
 
 ## Use it from an agent (MCP)
 
+`agtmem` speaks MCP over stdio, so any MCP-capable agent can use it. Installing
+the package creates **`agtmem-mcp`**, a no-argument executable — point your client
+straight at it and no `args` are needed:
+
+```bash
+pip install -e .
+which agtmem-mcp        # note the full path; most clients do not inherit PATH
+```
+
+Use the **full path** to the executable in client configs. Many MCP clients spawn
+servers with a minimal environment that does not include a virtualenv's `bin` or
+`Scripts` directory, so a bare `agtmem-mcp` may resolve for you in a terminal and
+still fail to start under the client.
+
+`AGTMEM_HOME` is optional and defaults to `~/.agtmem`. Set it only if you keep the
+store somewhere else.
+
+### WorkBuddy AI
+
+Add the server to `~/.workbuddy-ai/mcp.json` (note the filename — it is **not**
+`.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "agtmem": {
+      "command": "/absolute/path/to/agtmem-mcp",
+      "env": {
+        "AGTMEM_HOME": "~/.agtmem"
+      },
+      "disabled": false
+    }
+  }
+}
+```
+
+> **You must approve it once.** WorkBuddy does not spawn a third-party MCP server
+> just because it is in the config. Until you approve it, the connector shows as
+> disabled with *"This third-party MCP server requires your approval before
+> connecting."* Open the connector management page and click **Trust** on
+> `agtmem`. Restarting the app alone does not do it.
+
+One consequence worth knowing: approval is tied to the server's configuration, so
+**changing the `env` key names means approving it again**. Changing an env
+*value* does not.
+
+### Hermes
+
+Add a block under the top-level `mcp_servers:` key in `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  agtmem:
+    command: "/absolute/path/to/agtmem-mcp"
+    env:
+      AGTMEM_HOME: "~/.agtmem"
+    enabled: true
+    timeout: 120
+    connect_timeout: 60
+```
+
+Then reload with `/reload-mcp` (or verify with `hermes mcp test agtmem`).
+
+### Claude Desktop, Cursor, and other JSON clients
+
+```json
+{
+  "mcpServers": {
+    "agtmem": {
+      "command": "/absolute/path/to/agtmem-mcp"
+    }
+  }
+}
+```
+
+For clients that only accept `command` plus `args`, the module works too:
+
 ```json
 {
   "mcpServers": {
@@ -148,7 +225,7 @@ other.
 }
 ```
 
-Eight tools:
+### The eight tools
 
 | Tool | Purpose |
 |---|---|
@@ -161,13 +238,21 @@ Eight tools:
 | `agtmem_candidates` | list the candidate queue; `promote=<id>` to accept |
 | `agtmem_find` | locate a symbol, get `file:line` back |
 
-Two implementation details that matter if you write your own MCP server:
+`initialize` returns an `instructions` field telling the agent to call
+`agtmem_search` before starting work and to record conclusions with
+`agtmem_write`. Clients that surface it will nudge the agent to use memory
+without any prompt engineering on your side.
 
-- **stdout carries JSON-RPC and nothing else.** One stray `print()` corrupts
-  the stream and the client drops the connection. All human-readable output
-  goes to stderr. The test suite asserts that every stdout line parses as JSON.
+### If you write your own MCP server
+
+Two things that cost real debugging time here:
+
+- **stdout carries JSON-RPC and nothing else.** One stray `print()` corrupts the
+  stream and the client drops the connection. All human-readable output goes to
+  stderr. The test suite asserts that every stdout line parses as JSON.
 - **Tool failures are results, not protocol errors.** A missing note comes back
-  as `isError: true` with the connection intact, not as a JSON-RPC error.
+  as `isError: true` with the connection intact, not as a JSON-RPC error that
+  kills the session.
 
 ## Supersession instead of deletion
 
