@@ -1,7 +1,10 @@
-# Normalise line endings so the repository stores LF regardless of the platform
-# a contributor happens to use. Without this, a Windows checkout rewrites whole
-# files and every diff becomes noise.
-* text=auto eol=lf
+# Normalise line endings in the repository, not in anyone's working tree.
+#
+# `text=auto` means git stores LF internally and checks out whatever the platform
+# prefers, so a Windows checkout does not rewrite whole files and every diff is
+# real content. Forcing `eol=lf` in the working tree instead fights Windows
+# editors that write CRLF, which is how files end up with mixed endings.
+* text=auto
 
 # Windows-only files, if any are ever added, keep their CRLF.
 *.bat text eol=crlf

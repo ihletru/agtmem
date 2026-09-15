@@ -279,7 +279,7 @@ specific rather than a vague "inspired by others".
 ## How this was built
 
 This project was designed and written in collaboration between a human
-(Milosz) and an AI coding agent. The division of labour was roughly:
+(willhack-g) and an AI coding agent. The division of labour was roughly:
 
 - **The human** set the direction, rejected the subscription-model alternatives,
   chose the design principles, and made the calls that mattered — including
