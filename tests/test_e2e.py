@@ -301,6 +301,30 @@ def main() -> int:
               not list(home.rglob(".tmp-*")),
               str([str(p) for p in home.rglob(".tmp-*")]))
 
+        # ---------------------------------------------------- dependencies
+        # The README claims zero runtime dependencies. A claim like that rots the
+        # moment someone adds an import, so assert it rather than trusting it.
+        print("\n[9] zero runtime dependencies")
+        import ast
+        foreign = {}
+        for source in sorted((ROOT / "agtmem").glob("*.py")):
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                names = []
+                if isinstance(node, ast.Import):
+                    names = [a.name.split(".")[0] for a in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    names = [node.module.split(".")[0]]
+                for name in names:
+                    if name not in sys.stdlib_module_names:
+                        foreign.setdefault(str(source.name), set()).add(name)
+        check("every import in the package is stdlib", not foreign, str(foreign))
+
+        # The declared dependency list must stay empty too.
+        declared = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        check("pyproject declares no dependencies",
+              'dependencies = []' in declared)
+
     finally:
         shutil.rmtree(home, ignore_errors=True)
 

@@ -39,7 +39,7 @@ change — it drops the note tables, recreates them, and **repopulates from disk
 before returning. So a cold database heals on first use, and a schema change can
 never silently return wrong results from stale columns.
 
-The correct migration for a cache is always *rebuild*, never `ALTER`.
+For a cache, the right migration is to rebuild rather than to `ALTER`.
 
 Two tables are deliberately **not** dropped on a version bump: `symbols` and
 `usage`. They are not derived from the note files, and discarding the injection
@@ -66,7 +66,7 @@ The cost is real and paid explicitly:
 - **No `tree-sitter`** for the code map. `anatomy.py` uses per-language regexes
   instead. It is less precise — it will miss dynamically generated symbols and
   anything unusual — but every result carries a `file:line` the agent can verify,
-  and it never fails to parse.
+  and it does not reject a file it cannot understand the way a parser can.
 - **No `pydantic`** for frontmatter. A restricted flat `key: value` subset is
   parsed by hand, which is why the frontmatter format is deliberately flat. No
   nesting, no block scalars, no multi-line strings.
@@ -234,7 +234,7 @@ Go, Rust, and C#. This is explicitly a trade: less precise than an AST, but it
 needs no parser dependency and every result is verifiable at a `file:line`.
 
 Files are ranked by **how many other files import them** — a crude PageRank that
-costs nothing to compute and is a good proxy for "what should I read first".
+is cheap to compute and a reasonable proxy for "what should I read first".
 
 The payoff is `agtmem find <symbol>`: one line of output, no file read. Reading
 whole files to find a function is the most common way an agent burns its context

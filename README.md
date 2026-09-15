@@ -9,14 +9,14 @@ network.
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Dependencies: 0](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](pyproject.toml)
-[![Tests: 42](https://img.shields.io/badge/tests-42-brightgreen.svg)](tests/test_e2e.py)
+[![Tests: 44](https://img.shields.io/badge/tests-44-brightgreen.svg)](tests/test_e2e.py)
 [![MCP](https://img.shields.io/badge/MCP-stdio-8a2be2.svg)](docs/ARCHITECTURE.md)
 
 ---
 
 ## The problem
 
-Every agent-memory product wants to be the place your memory lives. That means
+Most agent-memory products want to be the place your memory lives. That means
 your accumulated context — the decisions, the bug fixes, the reasons you chose
 one thing over another — ends up in someone else's database, behind someone
 else's pricing page, in someone else's format.
@@ -42,7 +42,8 @@ Everything else follows from these, and each one is enforced by a test.
 
 3. **Zero runtime dependencies.**
    Python standard library only, so this still runs on a bare interpreter in ten
-   years. Verified in CI-by-test: every import is stdlib.
+   years. Asserted by the test suite, which parses every module and fails if any
+   import is not in the standard library.
 
 4. **Every write goes through one code path.**
    `index.index_note()` refreshes a note *and its supersession predecessor*.
@@ -249,7 +250,7 @@ cases, and every one of them plateaued at the same 0.667 on natural language:
 | AND-first with OR fallback | 0.533 |
 | *grep* | *0.533* |
 
-No lexical trick closed the gap, which is the expected result: paraphrase
+None of the four closed the gap, which is the expected result: paraphrase
 robustness is what embeddings buy you, and this project deliberately does not
 ship a model on the hot path. If your queries are paraphrases rather than terms,
 you want a vector index — and you should measure it, because the difference is

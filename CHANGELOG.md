@@ -26,7 +26,7 @@ First public release.
 - **CLI** (`cli.py`): 18 subcommands.
 - **MCP server** (`mcp_server.py`): JSON-RPC 2.0 over stdio, eight tools, zero
   dependencies.
-- **Tests** (`tests/test_e2e.py`): 42 checks including the delete-the-index
+- **Tests** (`tests/test_e2e.py`): 44 checks including the delete-the-index
   acceptance test, twelve concurrent writers, and assertions that the MCP
   server's stdout carries only JSON-RPC.
 
@@ -77,6 +77,16 @@ assuming the design worked. Details and numbers in
   to promote a candidate that the first pass ranked low.
 - Added `agtmem-mcp`, a no-argument MCP entry point, so MCP clients can point at
   an executable instead of passing `["-m", "agtmem", "mcp"]` as arguments.
+- **Claims about other products were overstated.** The README opened with "Every
+  agent-memory product wants to be the place your memory lives" — four were
+  examined, not all of them. Now "Most". The same review caught "No lexical trick
+  closed the gap" (four strategies were tested, not all possible ones) and a
+  "Verified in CI-by-test" line for a repository that has no CI.
+- **The zero-dependency claim is now asserted rather than stated.** A new test
+  parses every module and fails if any import is outside the standard library, and
+  checks that `pyproject.toml` still declares no dependencies. A claim like that
+  rots the moment someone adds an import, so it should not rest on trust.
+  Tests: 42 → 44.
 
 ### Measured
 
