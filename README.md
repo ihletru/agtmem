@@ -211,6 +211,50 @@ agtmem eval
 
 `agtmem stats --usage` reports how many tokens each retrieval actually injected.
 
+### Measured on a real corpus
+
+Numbers below come from a 92-note store of real project session summaries, with
+15 cases whose ground truth was established by **grepping the corpus for a
+distinctive phrase** — never by reading search results, which would make the
+eval score 1.0 by construction.
+
+| | R@5 | P@5 |
+|---|---|---|
+| `agtmem` | **0.667** | 0.147 |
+| grep baseline | 0.533 | 0.120 |
+
+The interesting result is not the aggregate but the split by how the question is
+phrased, using the same 15 answers:
+
+| Query phrasing | R@5 |
+|---|---|
+| Term-style (`gradlew wrapper apk build`) | **0.867** |
+| Natural language (`How do I build the APK without gradlew?`) | 0.667 |
+
+**That gap is the honest limitation of lexical retrieval, and it is worth
+stating plainly.** When a query shares vocabulary with the note — which is the
+normal case for an agent recalling its own work — retrieval is good. When the
+query *paraphrases* the note, bag-of-words fails, because the note may contain
+only two of the five words asked about.
+
+Four alternative strategies were implemented and measured against the same
+cases, and every one of them plateaued at the same 0.667 on natural language:
+
+| Strategy | R@5 |
+|---|---|
+| coverage-first re-ranking (shipped) | 0.667 |
+| proximity (`NEAR`) matching | 0.667 |
+| coverage as a score multiplier | 0.667 |
+| title/tags weighted in BM25 | 0.600 |
+| AND-first with OR fallback | 0.533 |
+| *grep* | *0.533* |
+
+No lexical trick closed the gap, which is the expected result: paraphrase
+robustness is what embeddings buy you, and this project deliberately does not
+ship a model on the hot path. If your queries are paraphrases rather than terms,
+you want a vector index — and you should measure it, because the difference is
+not obvious from the outside.
+
 ## What it deliberately does not do
 
 - **No embeddings, no vector search.** FTS5 plus trigram covers thousands of

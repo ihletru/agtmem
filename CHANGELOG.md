@@ -55,6 +55,45 @@ of real use. Documented in
   another process already held byte 0. Intermittent — roughly two failures in six
   runs, on a different line each time. Fixed by never writing to the lock file.
 
+### Changed
+
+Retrieval was reworked after measuring it against a real corpus, rather than
+assuming the design worked. Details and numbers in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#7-measuring).
+
+- **Two-stage retrieval.** Stage 1 recalls up to 60 candidates from both rankers
+  via RRF; stage 2 re-orders them by how many distinct query terms they contain.
+  BM25 rewards a rare term but not matching *several* terms, so without stage 2 a
+  long note repeating one common word outranks a short note that answers the
+  whole question. Measured: R@5 0.600 → 0.667.
+- **Stopwords are dropped before building the FTS query.** The query is an OR, so
+  every function word widens the pool with noise. The list covers English and
+  Polish.
+- **The trigram query now ORs individual tokens as quoted phrases.** It
+  previously quoted the *entire* query as one phrase, which matched nothing for
+  any real question — the trigram index was effectively dead. `ONSOLE_FILL` now
+  returns 4 hits where FTS returns 0.
+- **Recall pool raised from `limit * 4` to a fixed 60**, so re-ranking has room
+  to promote a candidate that the first pass ranked low.
+- Added `agtmem-mcp`, a no-argument MCP entry point, so MCP clients can point at
+  an executable instead of passing `["-m", "agtmem", "mcp"]` as arguments.
+
+### Measured
+
+On a 92-note store of real session summaries, 15 cases with ground truth
+established by grepping the corpus (not by reading search results):
+
+| | R@5 | P@5 |
+|---|---|---|
+| agtmem | 0.667 | 0.147 |
+| grep baseline | 0.533 | 0.120 |
+
+By query phrasing, over the same 15 answers: **0.867 term-style**, **0.667
+natural-language**. Four alternative strategies (proximity `NEAR`, coverage as a
+multiplier, title weighting, AND-first) were measured; all plateaued at 0.667 or
+below on natural language. The paraphrase gap is structural for lexical
+retrieval, not a missing trick.
+
 ### Notes
 
 - Token counts from `stats --usage` are `len(text) // 4` estimates, labelled as

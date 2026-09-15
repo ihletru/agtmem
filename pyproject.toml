@@ -47,6 +47,9 @@ dev = ["pytest>=8"]
 
 [project.scripts]
 agtmem = "agtmem.cli:main"
+# A no-argument MCP entry point, so MCP clients can point straight at an
+# executable instead of having to pass ["-m", "agtmem", "mcp"] as arguments.
+agtmem-mcp = "agtmem.mcp_server:serve"
 # Short alias. `mem` is generic enough to collide with something, so the
 # canonical entry point is `agtmem` and this is a convenience.
 mem = "agtmem.cli:main"

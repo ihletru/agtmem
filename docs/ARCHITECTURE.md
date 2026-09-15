@@ -168,6 +168,38 @@ it needs no calibration and cannot be dominated by one index's scale.
 best-matching column. Hardcoding the body column returns `NULL` whenever the hit
 was in the title, which silently degrades every result to its title.
 
+### Two-stage retrieval
+
+**Stage 1 — recall.** Both rankers contribute up to `RECALL = 60` candidates,
+fused with RRF. The FTS query is an OR of prefix-matched tokens, which is
+deliberately recall-oriented: precision is not this stage's job.
+
+**Stage 2 — precision.** Candidates are re-ordered by how many *distinct query
+terms* they actually contain, with the fused score as the tie-break.
+
+Stage 2 exists because BM25 rewards a rare term heavily but does not reward
+matching *several* terms. Without it, a long note repeating one common word
+outranks a short note that answers the whole question. Measured effect: R@5 went
+from 0.600 to 0.667 — one case in fifteen, which is why it was measured rather
+than assumed.
+
+Matching in stage 2 is prefix-tolerant (`term[:max(4, len-2)]`), so "derived"
+still credits "derive". That is a cheap stand-in for a stemmer, which FTS5 does
+not ship.
+
+**Query construction matters in two non-obvious ways:**
+
+- **Stopwords are dropped before the OR is built.** Because the query is an OR,
+  every function word widens the candidate pool with noise. The list carries both
+  English and Polish words, since the store is multilingual by design.
+- **The trigram query ORs the longer tokens as individual quoted phrases.** The
+  obvious reading — quoting the entire query as one phrase — matches nothing for
+  any real question. Per-token quoting is what makes the trigram index useful:
+  `ONSOLE_FILL` returns 0 hits from FTS and 4 from the trigram index.
+
+Note the asymmetry: the stopword and trigram changes moved R@5 by *zero*
+(0.600 → 0.600) and were kept anyway on separate, direct evidence. See §7.
+
 ## 5. Concurrency
 
 Two mechanisms, each solving a different failure:
@@ -223,6 +255,41 @@ know which you have without counting.
 
 Token counts are a `len(text) // 4` estimate, labelled as an estimate. It is
 never presented as a measured provider count.
+
+### What the numbers actually said
+
+Measured on a 92-note store of real project session summaries, 15 cases, ground
+truth established by grepping the corpus for a distinctive phrase rather than by
+reading search results:
+
+| | R@5 | P@5 |
+|---|---|---|
+| `agtmem` | 0.667 | 0.147 |
+| grep | 0.533 | 0.120 |
+
+Split by phrasing, over the same 15 answers: **0.867 for term-style queries**,
+**0.667 for natural-language ones**. The gap is the finding. Lexical retrieval
+works when the query shares vocabulary with the note; it degrades on paraphrase,
+because the answering note may contain only two of the five words asked about.
+
+Four alternative strategies were implemented and measured. All plateaued at
+0.667 on natural language (proximity `NEAR`, coverage as a multiplier, title
+weighting at 0.600, AND-first at 0.533). This is the expected outcome —
+paraphrase robustness is what embeddings buy, and this project deliberately does
+not put a model on the hot path. The honest conclusion is that the ceiling is
+structural, not a missing trick.
+
+Two methodological rules this exercise produced:
+
+1. **Ground truth must be independent of the thing being measured.** Deriving
+   expected ids from `agtmem search` would have produced a meaningless 1.0.
+2. **Measure the change, not the intent.** Filtering stopwords and rebuilding the
+   trigram query moved R@5 by *zero* (0.600 → 0.600). The coverage re-ranking
+   moved it by +0.067. The trigram fix was kept anyway, on separate evidence:
+   mid-token fragments like `ONSOLE_FILL` return 0 hits from FTS and 4 from the
+   trigram index, and 0 from the old whole-query phrase. Principled changes can
+   be worth keeping even when the aggregate metric does not move — but you have
+   to know that is what you are doing.
 
 ## 8. Bugs found only at runtime
 
@@ -280,9 +347,12 @@ depends on nothing.
 
 Stated plainly, because a design document that only lists strengths is marketing:
 
-- **Retrieval quality is measured but not yet tuned.** The harness exists; the
-  eval set starts empty. Until it is populated with real cases, the honest
-  position is that ranking quality is unknown.
+- **Retrieval quality is measured, and the ceiling is lexical.** R@5 = 0.667 on
+  natural-language questions against a 0.533 grep baseline; 0.867 on term-style
+  queries. Paraphrase-heavy queries are the known weak case, and four alternative
+  lexical strategies were measured without closing the gap. See §7.
+- **The eval set is small.** 15 cases. Enough to falsify a claim and to compare
+  strategies against each other, not enough to trust a third decimal place.
 - **No distillation pipeline.** Imported session summaries are raw. Converting
   them into `decisions` and `bugs` is agent work, and there is no automation for
   it.

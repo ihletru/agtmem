@@ -1,0 +1,16 @@
+# Normalise line endings so the repository stores LF regardless of the platform
+# a contributor happens to use. Without this, a Windows checkout rewrites whole
+# files and every diff becomes noise.
+* text=auto eol=lf
+
+# Windows-only files, if any are ever added, keep their CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets are never touched.
+*.png binary
+*.jpg binary
+*.gif binary
+*.zip binary
+*.gz binary
+*.sqlite binary
