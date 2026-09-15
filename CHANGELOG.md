@@ -118,4 +118,4 @@ retrieval, not a missing trick.
 - `~/.agtmem` is the default store location. `AGTMEM_HOME` overrides it;
   `MEM_HOME` is accepted as a legacy alias.
 
-[0.1.0]: https://github.com/willhack-g/agtmem/releases/tag/v0.1.0
+[0.1.0]: https://github.com/ihletru/agtmem/releases/tag/v0.1.0

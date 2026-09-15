@@ -9,7 +9,7 @@ description = "Agent memory you own: Markdown on disk, a disposable index, zero 
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
-authors = [{ name = "willhack-g" }]
+authors = [{ name = "ihletru" }]
 keywords = [
     "agent",
     "memory",
@@ -55,10 +55,10 @@ agtmem-mcp = "agtmem.mcp_server:serve"
 mem = "agtmem.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/willhack-g/agtmem"
-Repository = "https://github.com/willhack-g/agtmem"
-Issues = "https://github.com/willhack-g/agtmem/issues"
-Changelog = "https://github.com/willhack-g/agtmem/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/ihletru/agtmem"
+Repository = "https://github.com/ihletru/agtmem"
+Issues = "https://github.com/ihletru/agtmem/issues"
+Changelog = "https://github.com/ihletru/agtmem/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
 packages = ["agtmem"]

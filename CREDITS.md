@@ -130,7 +130,7 @@ claimed as an invention.
 
 ## How this was built
 
-Designed and written in collaboration between a human (willhack-g) and an AI coding
+Designed and written in collaboration between a human (ihletru) and an AI coding
 agent. The human set direction and made the consequential decisions; the agent
 wrote essentially all of the code, the tests, and the documentation.
 
