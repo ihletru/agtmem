@@ -274,10 +274,16 @@ def resolve_config() -> dict:
     # The interpreter executing this hook is by construction the right one, so
     # sys.executable is the default rather than a path recorded anywhere.
     python = pick("AGTMEM_PYTHON", "python") or sys.executable or "python3"
+    cite = cfg.get("cite")
     return {
         "python": python,
         "repo": pick("AGTMEM_REPO", "repo"),
         "store": pick("AGTMEM_HOME", "store"),
+        # Asking the model to name the notes it used. On by default because without
+        # it there is no way to tell a read note from an ignored one — and that
+        # question is the entire reason this integration exists. `"cite": false` in
+        # the sidecar turns the line off and leaves the block exactly as it was.
+        "cite": True if cite is None else bool(cite),
     }
 
 
@@ -588,6 +594,12 @@ def build_context(prompt: str, cwd: str = "", session_id: str = "") -> str | Non
 
     lines = [f"[agtmem] {len(fresh)} {plural(len(fresh))} w pamięci projektu "
              f"(pełna treść: `agtmem show <id>`):"]
+    # Placed second, not last: the block is truncated line by line, and an
+    # instruction that disappears whenever the notes are long is worse than none —
+    # it would make the counter read zero and look like "the model ignores notes".
+    if resolve_config()["cite"]:
+        lines.append("  Jeśli z którejś korzystasz, dopisz na końcu odpowiedzi "
+                     "`[agtmem:<id>]`.")
     bodies = 0
     for r in fresh:
         head = f"- {r.get('type')}/{r.get('id')}"
@@ -647,6 +659,18 @@ def build_session_context(cwd: str = "", session_id: str = "") -> str | None:
             f"Trafienia dostajesz też automatycznie przy każdym promptcie.{where}")
 
 
+def short_session(session_id: str) -> str:
+    """First 8 characters of the session id, or ``-`` when there is none.
+
+    The log has to be joinable with the transcripts: an injection is evidence of
+    nothing until you can find the answer that followed it. Without the session id
+    the only remaining key is the truncated prompt text, which is ambiguous the
+    moment two conversations open with the same words — and the whole point of the
+    log is to make `measure_usage.py` possible.
+    """
+    return (session_id or "-")[:8]
+
+
 def selfcheck() -> int:
     """`--selfcheck`: print the resolved config and run one real search.
 
@@ -662,6 +686,7 @@ def selfcheck() -> int:
     print("running as  :", sys.executable)
     print("repo        :", cfg["repo"] or "<agtmem default>")
     print("store       :", cfg["store"] or "<agtmem default>")
+    print("cite        :", cfg["cite"], "(asks the model to mark the notes it used)")
     rows = search("kara za dlugosc coverage")
     print(f"search      : {len(rows)} rows")
     for r in rows[:3]:
@@ -705,17 +730,19 @@ def main() -> int:
             log(f"ignored event={event}")
             return 0
     except Exception as exc:                      # noqa: BLE001 - must never raise
-        log(f"ERROR {event} raised: {exc!r} prompt={prompt[:60]!r}")
+        log(f"ERROR {event} raised: {exc!r} sess={short_session(session_id)} "
+            f"prompt={prompt[:60]!r}")
         return 0
 
     if context:
         out = {"hookSpecificOutput": {"hookEventName": event,
                                       "additionalContext": context}}
         sys.stdout.write(json.dumps(out, ensure_ascii=False))
-        log(f"INJECT event={event} {len(context)}c "
+        log(f"INJECT event={event} {len(context)}c sess={short_session(session_id)} "
             f"ids={','.join(injected_ids(context)) or '-'} prompt={prompt[:60]!r}")
     else:
-        log(f"silent event={event} prompt={prompt[:60]!r}")
+        log(f"silent event={event} sess={short_session(session_id)} "
+            f"prompt={prompt[:60]!r}")
     return 0
 
 

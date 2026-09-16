@@ -209,6 +209,26 @@ def main() -> int:
     check("the block still fits the cap", bool(ctx) and len(ctx) <= hook.MAX_BLOCK_CHARS,
           f"{len(ctx) if ctx else 0} vs {hook.MAX_BLOCK_CHARS}")
 
+    print("\n--- the counter's two handles: sess= and the cite line ---")
+    # `sess=` makes an injection joinable with the answer that followed it; without it
+    # measure_usage.py can only guess from the truncated prompt text. The cite line is
+    # what makes "was the note used?" answerable at all — and it must survive the
+    # block's truncation, or the counter reads zero and looks like model indifference.
+    check("short_session takes the first 8 characters",
+          hook.short_session("c33b13b8-9529-4191") == "c33b13b8", hook.short_session("c33b13b8-9529"))
+    check("short_session marks a missing id rather than printing nothing",
+          hook.short_session("") == "-")
+    check("the cite line is second, so truncation cannot drop it",
+          bool(ctx) and ctx.splitlines()[1].strip().startswith("Jeśli z którejś"),
+          repr(ctx.splitlines()[1] if ctx else None))
+    check("the cite line names the marker syntax", "[agtmem:<id>]" in (ctx or ""))
+    check("the cite line does not count as a note header", hook.injected_ids(ctx or "") ==
+          hook.injected_ids("\n".join(l for l in (ctx or "").splitlines()
+                                      if not l.strip().startswith("Jeśli"))),
+          repr(hook.injected_ids(ctx or "")))
+    check("cite can be turned off in the sidecar",
+          hook.resolve_config()["cite"] is True, "default must be on")
+
     print("\n--- robustness: hostile prompts must not raise ---")
     hostile = [
         'he said "build the apk" without gradlew',
@@ -307,6 +327,19 @@ def main() -> int:
         check("no other stdout noise", out.strip().count("\n") == 0, repr(out[:120]))
     except (ValueError, KeyError, TypeError) as exc:
         check("stdout parses as hook JSON", False, repr(exc))
+
+    # The log line is the counter's input. If it loses sess= or ids=, measure_usage.py
+    # silently degrades to guessing from prompt text — a healthy-looking log that
+    # cannot answer the only question it exists for.
+    try:
+        with open(hook.LOG, encoding="utf-8") as fh:
+            logged = fh.read()
+    except OSError:
+        logged = ""
+    check("the log line carries sess=", "sess=sess-pro" in logged, repr(logged[-160:]))
+    check("the log line carries ids=", "ids=" in logged, repr(logged[-160:]))
+    check("the log line carries the byte count", "c sess=" in logged or "c ids=" in logged,
+          repr(logged[-160:]))
 
     for label, payload in [("empty stdin", ""),
                            ("invalid json", "not json at all"),

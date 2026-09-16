@@ -175,7 +175,7 @@ sidecar, overridable with `AGTMEM_HOOK_RUNTIME`.
 
 | File | Purpose |
 | --- | --- |
-| `agtmem-inject.log` | one line per event: the query, the gate decision, the ids injected |
+| `agtmem-inject.log` | one line per event: the query, the gate decision, the session, the ids injected |
 | `agtmem-inject-state.json` | repeat suppression, keyed per conversation |
 
 The log is the only way to see what the hook decided, because its stdout goes
@@ -219,13 +219,63 @@ Environment beats sidecar beats default:
 `repo` and `store` are deliberately allowed to be absent — that means "let agtmem
 decide", which is the right answer for an installed package.
 
+One sidecar key is not a path: `"cite"` (default `true`) controls whether the injected
+block asks the model to mark the notes it used. See the section below.
+
+## Does it work? `measure_usage.py`
+
+Delivery was always measurable; *effect* was not, and an unfalsifiable claim of value is
+what let the pointer-only version look healthy for a day. The counter closes that:
+
+```bash
+python measure_usage.py --day 2026-09-16 --verbose
+```
+
+It joins three sources — the hook log (`ids=`, `sess=`), the store's index (document
+frequency) and the transcripts — and reports two arms.
+
+**Arm 1 — declared use.** The injected block asks for a marker:
+
+```
+[agtmem] 2 trafienia w pamięci projektu (pełna treść: `agtmem show <id>`):
+  Jeśli z którejś korzystasz, dopisz na końcu odpowiedzi `[agtmem:<id>]`.
+```
+
+The counter counts those markers. This is the only signal that means what it says: the
+model states which note it relied on. It sits second in the block, not last, because the
+block is truncated line by line and an instruction that vanishes whenever the notes are
+long would make the counter read zero and look like model indifference. Turn it off with
+`"cite": false` in the sidecar — the block then returns to exactly what it was.
+
+**Arm 2 — lexical trace, with a null.** For each injection, take the terms of the
+injected excerpt that the model *could only have learned from the note* — distinctive in
+the store (present in ≤ `--df-max` notes), absent from the prompt, absent from everything
+said earlier in the conversation — and check whether they appear in the answer. Then run
+the same test over notes that were **not** injected, against the same answer text.
+
+**Measured on the first day (2026-09-16, six injected notes carrying ids):**
+
+| matcher | measured | control | reading |
+| --- | --- | --- | --- |
+| exact | 0 / 6 | 3–6% | no power — the model paraphrases and does not reuse rare words |
+| six-character stem | 3 / 6 (50%) | 20–29% | ~2× the null at n=6: suggestive, not evidence |
+
+So arm 2 is a **null detector**, not a measurement: if the control is not clearly below
+the measured rate, believe nothing. Neither arm can show that a note *changed* the
+outcome — a trace is necessary evidence, not sufficient.
+
+Two limits to state plainly. It only sees injections made after `sess=` was added
+(earlier lines are resolved by prompt text and marked `~` as guesses), and injected
+context is **not** persisted in the transcript — which is exactly why the hook logs what
+it sent.
+
 ## Tests
 
 ```bash
 python test_agtmem_inject.py
 ```
 
-148 checks, no dependencies beyond the standard library and an `agtmem` that can
+157 checks, no dependencies beyond the standard library and an `agtmem` that can
 be imported. The suite is hermetic: it points `AGTMEM_HOOK_RUNTIME` at a
 temporary directory *before* importing the hook, so it never touches the live log
 or state. Getting that wrong once meant a verification call silenced a note for a
