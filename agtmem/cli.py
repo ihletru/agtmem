@@ -141,6 +141,7 @@ def cmd_search(args) -> int:
         note_type=args.type,
         limit=args.limit,
         include_superseded=args.all,
+        include_sessions=args.sessions,
     )
     text = json.dumps(rows, ensure_ascii=False) if args.json else " ".join(
         f"{r['id']} {r['title']} {r['snippet']}" for r in rows
@@ -415,13 +416,48 @@ def cmd_stats(args) -> int:
     return 0
 
 
+def _eval_target_problems(ids: list[str]) -> list[str]:
+    """Reject ground truth that search can never return.
+
+    Two ways to write a case that fails for the wrong reason: a note id that
+    does not exist, and a note that is superseded — superseded notes are hidden
+    from default search. Both look exactly like a retrieval bug once the case is
+    in the file, so they are caught at the moment of writing instead.
+    """
+    problems = []
+    for note_id in ids:
+        meta = index.get_meta(note_id)
+        if meta is None:
+            problems.append(f"no such note: {note_id} (reindex?)")
+        elif meta.get("status") != "active":
+            problems.append(
+                f"{note_id} is {meta.get('status')} — hidden from search by "
+                f"default; point the case at its successor"
+            )
+    return problems
+
+
 def cmd_eval(args) -> int:
+    if args.add_gap:
+        question = args.add_gap.strip()
+        if not question:
+            print("Format: --add-gap \"question\"", file=sys.stderr)
+            return 2
+        eval_mod.add_case(question, gap=True)
+        print(f"Added coverage gap to {store.EVAL_PATH}")
+        return 0
     if args.add:
         question, _, ids = args.add.partition("=>")
-        if not ids.strip():
+        wanted = [i.strip() for i in ids.split(",") if i.strip()]
+        if not wanted:
             print("Format: --add \"question => note-id\"", file=sys.stderr)
             return 2
-        eval_mod.add_case(question.strip(), [i.strip() for i in ids.split(",") if i.strip()])
+        problems = _eval_target_problems(wanted)
+        if problems:
+            for line in problems:
+                print(line, file=sys.stderr)
+            return 2
+        eval_mod.add_case(question.strip(), wanted)
         print(f"Added case to {store.EVAL_PATH}")
         return 0
     result = eval_mod.run()
@@ -484,6 +520,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--type", choices=store.TYPES)
     p.add_argument("--limit", type=int, default=10)
     p.add_argument("--all", action="store_true", help="include superseded notes")
+    p.add_argument(
+        "--sessions",
+        action="store_true",
+        help="include raw session transcripts (excluded by default)",
+    )
     p.add_argument("--json", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
     p.set_defaults(func=cmd_search)
@@ -556,6 +597,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("eval", help="measure retrieval quality")
     p.add_argument("--add", help='add a case: "question => note-id"')
+    p.add_argument(
+        "--add-gap",
+        help="record a question the store cannot answer (excluded from R@5)",
+    )
     p.set_defaults(func=cmd_eval)
 
     sub.add_parser("mcp", help="serve MCP over stdio").set_defaults(func=cmd_mcp)

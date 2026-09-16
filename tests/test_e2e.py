@@ -7,6 +7,8 @@ Covers the properties the design claims, not just the happy path:
   * the MCP server speaks JSON-RPC on stdout with nothing else mixed in
   * a tool error comes back as isError, not as a dropped connection
   * twelve concurrent writers lose no update
+  * a long note does not outrank the short note that answers the question
+  * the eval counts scored cases separately from known coverage gaps
 
 Run:  python tests/test_e2e.py
 """
@@ -324,6 +326,136 @@ def main() -> int:
         declared = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         check("pyproject declares no dependencies",
               'dependencies = []' in declared)
+
+        # ------------------------------------------------- scope derivation
+        # A project directory carrying a session timestamp used to yield the
+        # clock reading as the scope ("43-59"), which then became a bucket of
+        # its own in the store — indistinguishable from a real project.
+        print("\n[10] scope derivation")
+        from agtmem.ingest import scope_from_dir
+        cases = [
+            ("c-Users-milo-verbigem-android", "verbigem-android"),
+            ("c-Users-milo-projekty-online-ai-hub", "ai-hub"),
+            ("home-alice-code-myproject", "code-myproject"),
+            ("c-Users-milo-WorkBuddy AI-2026-09-04-11-43-59", "workbuddy-ai"),
+            ("c-Users-milo-WorkBuddy AI-2026-09-15-20-31-25", "workbuddy-ai"),
+            ("c-Users-milo-my-project-2026-09-03", "my-project"),
+            ("", "sessions"),
+        ]
+        for dirname, expected in cases:
+            got = scope_from_dir(dirname)
+            check(f"scope of {dirname!r} is {expected!r}", got == expected,
+                  f"got {got!r}")
+
+        # ------------------------------------------------ session exclusion
+        print("\n[11] raw sessions are excluded from search by default")
+        run(home, "add", "--title", "Flux capacitor design note",
+            "--type", "fact", "--scope", "t",
+            "--body", "The flux capacitor needs 1.21 gigawatts; see the build notes.")
+        # The transcript repeats the terms on purpose: a session is ~10x the
+        # size of a note, so it wins on length unless it is filtered out.
+        run(home, "add", "--title", "Session 2026-01-01 (t): summary",
+            "--type", "session", "--scope", "t",
+            "--body", "flux capacitor build notes gigawatts " * 40)
+
+        default = run(home, "search", "flux capacitor").stdout
+        check("default search returns the distilled note",
+              "flux-capacitor-design-note" in default, default)
+        check("default search hides the raw transcript",
+              "session-2026-01-01" not in default, default)
+
+        with_sessions = run(home, "search", "flux capacitor", "--sessions").stdout
+        check("--sessions brings the transcript back",
+              "session-2026-01-01" in with_sessions, with_sessions)
+
+        # The transcript must not eat RECALL slots either: excluding it in SQL
+        # means the note still surfaces even when the session outranks it.
+        check("the note is not crowded out by the transcript",
+              run(home, "search", "flux capacitor", "--limit", "1").stdout.strip()
+              .startswith("flux-capacitor-design-note"),
+              run(home, "search", "flux capacitor", "--limit", "1").stdout)
+
+        mcp_resp, _ = mcp_call(home, [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                        "clientInfo": {"name": "t", "version": "1"}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "agtmem_search",
+                        "arguments": {"query": "flux capacitor"}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": {"name": "agtmem_search",
+                        "arguments": {"query": "flux capacitor", "sessions": True}}},
+        ])
+        by_id = {r["id"]: r for r in mcp_resp if "id" in r}
+        default_text = by_id[2]["result"]["content"][0]["text"]
+        sessions_text = by_id[3]["result"]["content"][0]["text"]
+        check("MCP search hides sessions by default",
+              "session-2026-01-01" not in default_text, default_text[:200])
+        check("MCP search exposes sessions=true",
+              "session-2026-01-01" in sessions_text, sessions_text[:200])
+
+        # -------------------------------------------------- length penalty
+        print("\n[12] a long note does not outrank the short note that answers")
+        run(home, "add", "--title", "Warp core alignment procedure",
+            "--type", "fact", "--scope", "t",
+            "--body", "Warp core alignment: tighten the plasma injector in three passes.")
+        # Equal term coverage, but ~7 kB against ~70 B. Counting presence alone
+        # scored these identically, and BM25 then handed the win to the long one
+        # because term frequency rises with length — which is the bug the length
+        # penalty in _coverage() exists to stop.
+        run(home, "add", "--title", "Warp core log",
+            "--type", "log", "--scope", "t",
+            "--body", "warp core alignment plasma injector " * 200)
+
+        query = "warp core alignment plasma injector"
+        top = run(home, "search", query).stdout
+        check("the short note wins on equal coverage",
+              top.strip().startswith("warp-core-alignment-procedure"), top[:300])
+        # The penalty must not be a filter: the long note is still reachable.
+        check("the long note is still returned, just lower",
+              "warp-core-log" in top, top[:300])
+
+        # ------------------------------------------------------------ eval
+        print("\n[13] the eval separates retrieval misses from coverage gaps")
+        run(home, "add", "--title", "Borg transwarp conduit notes",
+            "--type", "fact", "--scope", "t",
+            "--body", "Transwarp conduit: the Borg use six hubs, not one.")
+        (home / "eval.txt").write_text(
+            "# a comment line, which must be ignored\n"
+            "How many transwarp hubs do the Borg use? => borg-transwarp-conduit-notes\n"
+            "! How do we verify the downloaded APK is intact?\n",
+            encoding="utf-8",
+        )
+        out = run(home, "eval").stdout
+        check("only the scored case counts", "Cases: 1 scored" in out, out)
+        check("the gap is excluded from the case count",
+              "1 known gap(s) excluded" in out, out)
+        check("the gap is named as a distillation gap",
+              "distillation gap, not a retrieval miss" in out, out)
+        mem_row = next((l for l in out.splitlines() if l.startswith("mem")), "")
+        check("the scored case was actually found", "1.0" in mem_row, mem_row)
+
+        run(home, "eval", "--add-gap", "Why is the sky blue?")
+        appended = (home / "eval.txt").read_text(encoding="utf-8")
+        check("--add-gap appends a gap line",
+              "! Why is the sky blue?" in appended, appended)
+
+        # Ground truth that search can never return fails for the wrong reason,
+        # so it is refused at the moment of writing rather than debugged later.
+        run(home, "add", "--title", "Old flux rule", "--type", "fact",
+            "--scope", "t", "--body", "superseded shortly")
+        run(home, "add", "--title", "New flux rule", "--type", "fact",
+            "--scope", "t", "--body", "the current one",
+            "--supersedes", "old-flux-rule")
+        guard = run(home, "eval", "--add", "Why flux? => old-flux-rule")
+        check("--add refuses a superseded target",
+              guard.returncode == 2 and "superseded" in guard.stderr, guard.stderr)
+        missing = run(home, "eval", "--add", "Why flux? => no-such-note-here")
+        check("--add refuses a missing target",
+              missing.returncode == 2 and "no such note" in missing.stderr,
+              missing.stderr)
+        ok = run(home, "eval", "--add", "Why flux? => new-flux-rule")
+        check("--add accepts an active target", ok.returncode == 0, ok.stderr)
 
     finally:
         shutil.rmtree(home, ignore_errors=True)

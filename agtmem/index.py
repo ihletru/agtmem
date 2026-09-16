@@ -15,6 +15,7 @@ Results from both are merged with Reciprocal Rank Fusion.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import sqlite3
 import time
@@ -165,9 +166,28 @@ def reindex(verbose: bool = False) -> dict:
 # the query, and a note cut here can never come back.
 RECALL = 60
 
+# The size a note may reach before its term coverage starts being discounted.
+# Measured, not guessed, and the measurement mattered: the first value tried was
+# the median note size (2 500 B) and it *lowered* eval R@5 from 1.00 to 0.90,
+# because the notes that actually answer questions are the substantial ones —
+# their median is 3 488 B, not 2 321 B.
+#
+# Sweeping the reference against two metrics at once (knowledge-layer R@5, and
+# how many correct notes a raw session pushes out of the top 5) gives a plateau
+# of 3 500–6 500 B where both are perfect. 5 000 B is the middle of it, so it has
+# margin on both sides instead of sitting on a cliff edge. In distributional
+# terms that is the 97th percentile of note size: every ordinary note scores on
+# coverage alone, and only transcript-scale documents are discounted. A raw
+# session (median 21 160 B) is 4.2x this, the distillation register (35 104 B)
+# is 7.0x.
+COVERAGE_FREE_BYTES = 5000
+
 # Function words carry no retrieval signal, and because the FTS query is an OR,
 # every one of them widens the candidate pool with noise. Measured effect on the
-# eval set: R@5 went from 0.60 to 0.87 when these were filtered.
+# eval set as it stood in 2026-09-15: R@5 went from 0.60 to 0.87 when these were
+# filtered. That set has since been retired (its ground truth pointed at raw
+# transcripts), so treat the magnitude as indicative and the direction as the
+# finding — filtering stopwords before an OR is what matters.
 _STOPWORDS = frozenset("""
 a about an and are as at be been but by can could did do does for from had has
 have how i if in into is it its me my of on or our should so some than that the
@@ -212,30 +232,48 @@ def _trigram_query(text: str) -> str:
     return " OR ".join(f'"{t}"' for t in tokens) if tokens else ""
 
 
-def _search_fts(conn, query: str, limit: int, scope=None, note_type=None):
+def _search_fts(conn, query: str, limit: int, exclude_type: str | None = None):
+    """BM25 pass. `exclude_type` filters in SQL, not afterwards.
+
+    Filtering after the fact would let excluded notes eat RECALL slots and hand
+    back fewer results than asked for — raw sessions are long and match almost
+    anything, so they would take most of the budget.
+    """
     match = _fts_query(query)
     if not match:
         return []
     sql = """
-        SELECT id, bm25(notes_fts) AS rank,
+        SELECT notes_fts.id AS id, bm25(notes_fts) AS rank,
                snippet(notes_fts, -1, '[', ']', ' … ', 14) AS snip
-        FROM notes_fts WHERE notes_fts MATCH ?
-        ORDER BY rank LIMIT ?
+        FROM notes_fts JOIN notes ON notes.id = notes_fts.id
+        WHERE notes_fts MATCH ?
     """
-    rows = conn.execute(sql, (match, limit)).fetchall()
+    params: list = [match]
+    if exclude_type:
+        sql += " AND notes.type != ?"
+        params.append(exclude_type)
+    sql += " ORDER BY rank LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
     return [(r["id"], r["rank"], r["snip"]) for r in rows]
 
 
-def _search_trigram(conn, query: str, limit: int):
+def _search_trigram(conn, query: str, limit: int, exclude_type: str | None = None):
     match = _trigram_query(query)
     if not match:
         return []
+    sql = (
+        "SELECT notes_tri.id AS id, bm25(notes_tri) AS rank FROM notes_tri "
+        "JOIN notes ON notes.id = notes_tri.id WHERE notes_tri MATCH ?"
+    )
+    params: list = [match]
+    if exclude_type:
+        sql += " AND notes.type != ?"
+        params.append(exclude_type)
+    sql += " ORDER BY rank LIMIT ?"
+    params.append(limit)
     try:
-        rows = conn.execute(
-            "SELECT id, bm25(notes_tri) AS rank FROM notes_tri "
-            "WHERE notes_tri MATCH ? ORDER BY rank LIMIT ?",
-            (match, limit),
-        ).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     except sqlite3.OperationalError:
         return []
     return [(r["id"], r["rank"], "") for r in rows]
@@ -250,14 +288,30 @@ def _rrf(lists: list[list[tuple]], k: int = RRF_K) -> dict:
     return scores
 
 
-def _coverage(conn, ids: list[str], terms: list[str]) -> dict[str, int]:
-    """How many distinct query terms each candidate actually contains.
+def _coverage(
+    conn, ids: list[str], terms: list[str]
+) -> dict[str, tuple[int, float]]:
+    """Query terms each candidate contains, discounted by how long it is.
 
-    BM25 rewards a rare term heavily but does not directly reward matching
-    *several* terms, so a long note that repeats one common word can outrank a
-    short note that answers the whole question. Counting distinct term coverage
-    and sorting on it first fixes that, and it is cheap: the candidates are
-    already fetched, and a substring test needs no index.
+    Returns `{id: (terms_matched, score)}`.
+
+    Counting *presence* alone is not enough, and that was a real bug. A raw
+    session is roughly nine times the size of a distilled note (measured median
+    21 160 B vs 2 321 B), so it contains every query term simply by being a
+    transcript of everything — and it then outranked the short note that actually
+    answers the question. Measured on the eval set with sessions left in the pool,
+    15 of 20 correct notes were pushed out of the top five.
+
+    So the score is term coverage divided by a length penalty: full credit up to
+    COVERAGE_FREE_BYTES, then logarithmic. Log rather than linear for the same
+    reason BM25 saturates — the difference between a 2 kB and a 20 kB note matters
+    far more than the difference between 20 kB and 40 kB, and the tenth repetition
+    of a word adds nothing.
+
+    Note the penalty is *relative*, so it cannot hide a genuinely relevant long
+    note: a 35 kB document that really does match more of the question than
+    anything else still wins. It only stops length from being mistaken for
+    relevance.
 
     Matching is prefix-tolerant, so "derived" still credits "derive" — a cheap
     stand-in for a stemmer, which FTS5 does not ship.
@@ -269,7 +323,7 @@ def _coverage(conn, ids: list[str], terms: list[str]) -> dict[str, int]:
         f"SELECT id, title, body, tags FROM notes_fts WHERE id IN ({placeholders})",
         list(ids),
     ).fetchall()
-    out: dict[str, int] = {}
+    out: dict[str, tuple[int, float]] = {}
     for row in rows:
         blob = f"{row['title']} {row['body']} {row['tags']}".lower()
         words = set(re.findall(r"\w+", blob))
@@ -278,7 +332,12 @@ def _coverage(conn, ids: list[str], terms: list[str]) -> dict[str, int]:
             stem = term[: max(4, len(term) - 2)]
             if term in blob or any(w.startswith(stem) for w in words):
                 hits += 1
-        out[row["id"]] = hits
+        if not hits:
+            out[row["id"]] = (0, 0.0)
+            continue
+        size = len(blob.encode("utf-8"))
+        penalty = 1.0 + math.log2(max(1.0, size / COVERAGE_FREE_BYTES))
+        out[row["id"]] = (hits, hits / penalty)
     return out
 
 
@@ -289,23 +348,37 @@ def search(
     note_type: str | None = None,
     limit: int = 10,
     include_superseded: bool = False,
+    include_sessions: bool = False,
 ) -> list[dict]:
     """Hybrid search over both indexes. Superseded notes are excluded by default.
 
     Two stages. **Recall** lets both rankers contribute up to RECALL candidates,
     fused with RRF. **Precision** then re-orders them by how many distinct query
-    terms each note actually contains, with the fused score as the tie-break.
+    terms each note contains *per unit of length*, with the fused score as the
+    tie-break.
 
     The second stage is what makes a natural-language question work. BM25 rewards
     a rare term heavily but does not reward matching *several* terms, so without
     it a long note repeating one common word outranks a short note that answers
-    the whole question.
+    the whole question. Counting terms alone is not enough either — see
+    `_coverage` for why length has to be discounted, and what it cost when it
+    was not.
+
+    **Raw sessions are excluded by default.** A session is input, not knowledge:
+    it is the transcript the distilled notes were extracted from. At ~20 kB it is
+    roughly ten times the size of a note, so it matches nearly every query and
+    wins on length rather than on relevance. Pass `include_sessions=True` to get
+    them back — useful when hunting for something that was never distilled.
     """
     conn = connect()
     try:
         ensure_schema(conn)
-        fts = _search_fts(conn, query, RECALL)
-        ranked = _rrf([fts, _search_trigram(conn, query, RECALL)])
+        exclude = None if include_sessions else "session"
+        fts = _search_fts(conn, query, RECALL, exclude_type=exclude)
+        ranked = _rrf([
+            fts,
+            _search_trigram(conn, query, RECALL, exclude_type=exclude),
+        ])
         if not ranked:
             return []
 
@@ -313,7 +386,7 @@ def search(
         coverage = _coverage(conn, list(ranked), terms)
         order = sorted(
             ranked.items(),
-            key=lambda kv: (-coverage.get(kv[0], 0), -kv[1]),
+            key=lambda kv: (-coverage.get(kv[0], (0, 0.0))[1], -kv[1]),
         )
         # Snippets come from the same FTS pass — fetch once, not once per row.
         snippets = {cid: snip for cid, _, snip in fts}
@@ -324,10 +397,13 @@ def search(
                 continue
             if not include_superseded and row["status"] != "active":
                 continue
+            if not include_sessions and row["type"] == "session":
+                continue
             if scope and row["scope"] != scope:
                 continue
             if note_type and row["type"] != note_type:
                 continue
+            matched, cov = coverage.get(note_id, (0, 0.0))
             out.append({
                 "id": row["id"],
                 "title": row["title"],
@@ -338,7 +414,8 @@ def search(
                 "updated": row["updated"],
                 "path": row["path"],
                 "score": round(score, 6),
-                "coverage": coverage.get(note_id, 0),
+                "coverage": round(cov, 3),
+                "terms": matched,
                 "snippet": snippets.get(note_id) or (row["title"] or ""),
             })
             if len(out) >= limit:

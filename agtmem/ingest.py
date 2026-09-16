@@ -53,6 +53,14 @@ BARE_RE = re.compile(
     r"Please summarize the conversation above(?P<body>.*)", re.DOTALL
 )
 
+# WorkBuddy (and Claude) name ad-hoc project directories after the workspace
+# plus the moment the session started, e.g.
+# ``c-Users-milo-WorkBuddy AI-2026-09-04-11-43-59``. Without this the derived
+# scope is the trailing clock reading ("43-59"), which is not a project and
+# silently becomes its own bucket in the store.
+_TIMESTAMP_TAIL = re.compile(r"(?:-\d{4}-\d{2}-\d{2}(?:-\d{2}){0,3})+$")
+
+
 def scope_from_dir(dirname: str) -> str:
     """Derive a short scope name from a slugified project directory.
 
@@ -60,11 +68,14 @@ def scope_from_dir(dirname: str) -> str:
     ``c-Users-alice-code-myproject`` or ``home-alice-code-myproject``.
     The leading ``users/<name>`` or ``home/<name>`` is dropped so the
     scope is the project rather than the whole path, and only the last
-    two segments are kept to stay short.
+    two segments are kept to stay short. A trailing session timestamp is
+    dropped before that, so an ad-hoc workspace yields the workspace name
+    rather than a clock reading.
     """
     slug = dirname.lower().replace("\\", "/").strip("/")
     slug = re.sub(r"^[a-z]:", "", slug)  # drop a drive letter
     slug = re.sub(r"[^a-z0-9-]+", "-", slug).strip("-")
+    slug = _TIMESTAMP_TAIL.sub("", slug).strip("-")
     parts = [p for p in slug.split("-") if p]
     # Only strip when the marker is at the front, so a project that
     # happens to be called "home" is left alone.

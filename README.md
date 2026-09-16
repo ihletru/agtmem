@@ -138,8 +138,7 @@ other.
 ## Use it from an agent (MCP)
 
 `agtmem` speaks MCP over stdio, so any MCP-capable agent can use it. Installing
-the package creates **`agtmem-mcp`**, a no-argument executable — point your client
-straight at it and no `args` are needed:
+the package creates **`agtmem-mcp`**, a no-argument executable:
 
 ```bash
 pip install -e .
@@ -154,18 +153,23 @@ still fail to start under the client.
 `AGTMEM_HOME` is optional and defaults to `~/.agtmem`. Set it only if you keep the
 store somewhere else.
 
+Most clients are satisfied with `command` alone. **WorkBuddy is not** — read the
+next section before writing its config, or you will lose an evening to it.
+
 ### WorkBuddy AI
 
 Add the server to `~/.workbuddy-ai/mcp.json` (note the filename — it is **not**
-`.mcp.json`):
+`.mcp.json`). On Windows the backslashes must be escaped:
 
 ```json
 {
   "mcpServers": {
     "agtmem": {
-      "command": "/absolute/path/to/agtmem-mcp",
+      "command": "C:\\Users\\you\\envs\\default\\Scripts\\agtmem-mcp.exe",
+      "args": [],
       "env": {
-        "AGTMEM_HOME": "~/.agtmem"
+        "AGTMEM_HOME": "C:\\Users\\you\\.agtmem",
+        "PYTHONIOENCODING": "utf-8"
       },
       "disabled": false
     }
@@ -173,15 +177,55 @@ Add the server to `~/.workbuddy-ai/mcp.json` (note the filename — it is **not*
 }
 ```
 
+> **`"args": []` is load-bearing — omit the key and WorkBuddy exposes zero
+> tools.** The server still starts, still answers `tools/list` with all eight
+> tools in under a second, and still shows as enabled and trusted in the UI. It
+> just never reaches the agent, and nothing in the logs says so.
+>
+> This is not hypothetical: it cost an evening here, and the same missing key had
+> silently disabled an unrelated third-party server in the same config — which is
+> what finally gave the pattern away.
+>
+> The fix is free. WorkBuddy hashes
+> `sha256(command + "|" + sorted(args).join(",") + "|" + sorted(env KEYS).join(","))`,
+> and a missing `args` and `args: []` serialise identically — so **the hash is
+> unchanged and the approval below survives**. No second Trust click.
+
 > **You must approve it once.** WorkBuddy does not spawn a third-party MCP server
 > just because it is in the config. Until you approve it, the connector shows as
 > disabled with *"This third-party MCP server requires your approval before
 > connecting."* Open the connector management page and click **Trust** on
 > `agtmem`. Restarting the app alone does not do it.
 
-One consequence worth knowing: approval is tied to the server's configuration, so
-**changing the `env` key names means approving it again**. Changing an env
-*value* does not.
+Two more consequences of that hash:
+
+- It covers the **`env` key names, not their values**. Changing `AGTMEM_HOME`'s
+  value is free; adding or removing an env key means approving the server again.
+- **Every edit to `mcp.json` needs a restart.** The file is read at startup only,
+  so a correct fix applied to a running app changes nothing yet.
+
+#### If the tools never appear
+
+Four independent layers can each fail, and from the outside **they all look the
+same**: no tools, no error. Check them in this order.
+
+1. **Is it trusted?** `~/.workbuddy-ai/mcp-approvals.json` must contain
+   `<configHash>::agtmem`. *Enabled* and *trusted* are different things.
+2. **Is the entry well-formed?** Specifically, does it carry `"args": []`?
+3. **Is the server itself healthy?** Rule this out *first*, by probing rather than
+   by reading logs. WorkBuddy spawns stdio servers with **only the variables in
+   the server's `env` block** — it does not inherit your shell — so reproduce
+   exactly that: spawn the command with just those keys plus
+   `SystemRoot`/`windir`/`PATH`, send `initialize` and `tools/list`, and count the
+   tools. If that prints eight, the fault is in the client config, not here.
+4. **Only then** read the logs. They live in a dated directory, not `main.log`:
+   `~/.workbuddy-ai/logs/<YYYY-MM-DD>/`, where `skipping untrusted server "agtmem"`
+   means exactly what it says. Note that current builds log **no connect line for
+   stdio servers at all**, so a missing line proves nothing either way.
+
+The one reliable test is the tool index itself: have the agent look up
+`mcp__agtmem__agtmem_search`. If that name does not resolve, the tools are not
+loaded — whatever the UI and the logs suggest.
 
 ### Hermes
 
@@ -268,6 +312,134 @@ Default search skips superseded notes; `--all` includes them. You keep the
 history of *what changed and why*, which is usually more valuable than the
 current answer alone.
 
+## Raw sessions are not knowledge
+
+`type: session` notes are **excluded from search by default**. Pass `--sessions`
+(or `sessions: true` over MCP) to get them back.
+
+A session is the transcript a note was distilled *from* — input, not knowledge.
+It is also roughly ten times the size of a note (median 20 kB against 2 kB), and
+BM25 rewards length: a transcript repeats every term the question uses, so it
+outranks the note that actually answers it. The effect is not subtle. On a store
+with 92 sessions among 275 notes, *every one of the top ten results* for
+`"How do I build the Android APK without gradlew?"` was a raw session. With
+sessions excluded, the first result is `verbigem-android-build-invocation` — the
+note that answers the question.
+
+The exclusion happens in SQL rather than after ranking. Filtering afterwards
+would let sessions consume the recall budget and hand back fewer results than
+asked for; the note has to surface even when a transcript would have outranked
+it.
+
+## Feeding it: distilling sessions
+
+`ingest-sessions` imports raw session summaries. That is the *input*, not the
+answer — a store holding 92 raw sessions is a store nobody reads. Turning them
+into `decisions/`, `facts/` and `bugs/` is a two-stage job, and both stages
+matter.
+
+### Stage 1 — distillation
+
+Read a raw session and keep only what has lasting value: a decision, a fact
+about the system, a bug with symptom/cause/fix. Skip narrative, plans, and
+one-off exploration.
+
+Measured density on a real corpus: **4.2 notes per session**. Across 92 sessions
+that is ~390 notes — which is the trap. Distillation on its own swaps one
+problem ("too many raw sessions") for another ("too many notes").
+
+### Stage 2 — consolidation
+
+Merge notes covering the same subject into one stronger note, and mark the
+sources superseded. Nothing is lost: superseded files stay on disk and
+`search --all` still finds them, they simply stop competing for rank with the
+note that replaced them.
+
+On the same corpus, 21 distilled notes collapsed to 12 — three Play Console
+notes into one, three Firebase identity notes into one, two admin-panel notes
+into one, and so on. **A consolidation pass roughly halves the count without
+dropping a fact.**
+
+### Cap the batch
+
+Five to eight sessions per run. Not a performance limit — a review limit. 390
+notes nobody reads is a worse deliverable than 21 notes somebody does.
+
+### Mark what has been processed
+
+The store cannot do this for you, and the obvious place does not work: a custom
+frontmatter key is **silently dropped** on the next save, because
+`Note.from_file()` reads only the fixed `FM_KEYS` tuple and `Note.render()`
+writes `to_meta()` back over it.
+
+Use an append-only register note instead (`log/session-distillation-audit`).
+Every run appends a section listing the session ids it consumed, and *no entry
+means not processed*. It is greppable, human-readable, and survives a
+serialization round-trip.
+
+### Where `scope` comes from
+
+`ingest-sessions` derives a session's scope from the transcript's project
+directory, not from the conversation: the directory is slugified, a leading
+`users/<name>` or `home/<name>` is dropped, and the last two segments are kept.
+A trailing session timestamp is stripped first — WorkBuddy names ad-hoc project
+directories after the workspace *plus* the moment the session started, so
+`c-Users-milo-WorkBuddy AI-2026-09-04-11-43-59` yields `workbuddy-ai` and not
+the clock reading `43-59`.
+
+Two consequences worth knowing:
+
+- **A session run from a scratch workspace gets the scratch scope**, not the
+  project it was actually about. The directory cannot know what was discussed.
+  If that matters, re-scope the note by hand — `scope` is a frontmatter field and
+  nothing in the store depends on it for file layout (except `type: project`).
+- **Nothing validates a scope.** A bad one is not an error, it is a new bucket,
+  and `agtmem stats` will list it next to your real projects as if it were one.
+  Glance at that list occasionally.
+
+### Running it as a scheduled job
+
+The server deliberately cannot do this — rule 2 above forbids LLM calls from
+`agtmem` itself, and that is the right call. Distillation belongs to whatever
+agent is already running, expressed as a scheduled prompt. The configuration
+used here:
+
+| | |
+|---|---|
+| schedule | daily, 07:00 local |
+| cap | 8 sessions per run |
+| scope | one scope per run, in a fixed order; move to the next when the current one runs out |
+| consolidation | mandatory, in the same run |
+| register | append to `log/session-distillation-audit` |
+
+The prompt hands the agent six steps: (1) read the register to learn what is
+already done, (2) take the **first scope in the list that still has unprocessed
+sessions** and pick at most 8 of them, (3) distill them into
+decisions/facts/bugs, (4) consolidate duplicates and mark the sources
+superseded, (5) append a register section, (6) run `reindex` and `doctor`.
+
+**One scope per run is deliberate.** The consolidation step has to notice that
+two notes say the same thing, and that judgement is much easier inside a single
+project's vocabulary than across three of them. A run that drains a scope
+early is a short run, not a wasted one.
+
+The list itself is just an ordered set of scope names, and the order should
+match whatever you care about. It only has to be explicit: "the largest
+remaining scope" sounds reasonable and drifts, because it depends on the agent
+noticing that the previous scope is empty.
+
+Two things to get right if you copy it:
+
+- **Pass every field when updating a note.** `write_note(..., update=True)`
+  replaces `type`, `scope` and `tags` instead of merging them, and the file
+  moves to a different directory. An update that omits them silently resets the
+  note's type and relocates it — which is how a `log/` note ends up in `facts/`.
+- **Cap the run.** An uncapped job produces more notes than anyone will read,
+  which is the exact failure this section exists to prevent.
+
+Nothing in the store depends on the schedule. It is a convenience layer over
+`agtmem add` and `agtmem search`: turn it off and the store keeps working.
+
 ## Concurrency
 
 Writes take an OS advisory lock (`fcntl.flock` / `msvcrt.locking`) and are
@@ -292,60 +464,96 @@ grep over the same files, so the number means something:
 
 ```bash
 agtmem eval --add "why is the index disposable => index-is-disposable"
+agtmem eval --add-gap "a question no note answers"
 agtmem eval
 ```
+
+A line beginning with `!` records a **known coverage gap**: a question the store
+cannot answer because no note was ever distilled for it. Those are counted
+separately and excluded from R@5, because no amount of ranking work can return a
+note that was never written — mixing them in would make a distillation gap look
+like a retrieval failure and send you tuning the wrong component.
 
 `agtmem stats --usage` reports how many tokens each retrieval actually injected.
 
 ### Measured on a real corpus
 
-Numbers below come from a 92-note store of real project session summaries, with
-15 cases whose ground truth was established by **grepping the corpus for a
-distinctive phrase** — never by reading search results, which would make the
+Numbers below come from a 275-note store (183 distilled notes plus 92 raw
+session transcripts) with 20 scored cases. Ground truth was established by
+**grepping the corpus for a distinctive phrase** and confirming it occurs in
+exactly one active note — never by reading search results, which would make the
 eval score 1.0 by construction.
 
 | | R@5 | P@5 |
 |---|---|---|
-| `agtmem` | **0.667** | 0.147 |
-| grep baseline | 0.533 | 0.120 |
+| `agtmem` | **1.00** | 0.21 |
+| grep baseline | 0.05 | 0.01 |
 
-The interesting result is not the aggregate but the split by how the question is
-phrased, using the same 15 answers:
+P@5 looks low and is not a defect: most questions have exactly one right answer,
+so 0.2 is the best achievable score. It is reported anyway, because a metric
+that can only go up is not a metric.
 
-| Query phrasing | R@5 |
-|---|---|
-| Term-style (`gradlew wrapper apk build`) | **0.867** |
-| Natural language (`How do I build the APK without gradlew?`) | 0.667 |
+Two rules that cost real debugging time, and are worth copying if you build your
+own set:
 
-**That gap is the honest limitation of lexical retrieval, and it is worth
-stating plainly.** When a query shares vocabulary with the note — which is the
-normal case for an agent recalling its own work — retrieval is good. When the
-query *paraphrases* the note, bag-of-words fails, because the note may contain
-only two of the five words asked about.
+- **Never point ground truth at a raw session.** It is input, not knowledge, and
+  once sessions are excluded from search the case fails for a reason unrelated to
+  ranking quality.
+- **Never point it at a `superseded` note.** Superseded notes are hidden by
+  default, so the case is unanswerable by construction. Four of the first
+  draft's targets had been superseded and had to be re-pointed at their
+  successors. `agtmem eval --add` now refuses both mistakes instead of writing
+  the case.
 
-Four alternative strategies were implemented and measured against the same
-cases, and every one of them plateaued at the same 0.667 on natural language:
+### Two layers, measured separately
 
-| Strategy | R@5 |
-|---|---|
-| coverage-first re-ranking (shipped) | 0.667 |
-| proximity (`NEAR`) matching | 0.667 |
-| coverage as a score multiplier | 0.667 |
-| title/tags weighted in BM25 | 0.600 |
-| AND-first with OR fallback | 0.533 |
-| *grep* | *0.533* |
+An agent only ever reads distilled notes, so that is the layer the headline
+number covers. But the same search can be pointed at the raw transcripts with
+`--sessions`, and there the ranking used to fail badly: a session has a median
+size of 21 160 B against 2 321 B for a note, so it contains every query term
+simply by being a transcript of everything, and it won on length rather than on
+relevance.
 
-None of the four closed the gap, which is the expected result: paraphrase
-robustness is what embeddings buy you, and this project deliberately does not
-ship a model on the hot path. If your queries are paraphrases rather than terms,
-you want a vector index — and you should measure it, because the difference is
-not obvious from the outside.
+Counting term *presence* could not fix that, because both documents contain the
+same terms. What fixed it was discounting coverage by length — see
+`COVERAGE_FREE_BYTES`. Measured on the same 20 cases, with sessions left in the
+pool:
+
+| | before | after |
+|---|---|---|
+| correct note pushed out of the top 5 | 15/20 | **0/20** |
+| top result was a raw transcript | 17/20 | **0/20** |
+
+### What this eval does not measure
+
+It now sits at R@5 = 1.00 on the knowledge layer, which means **it has no
+headroom left and can no longer tell two good ranking strategies apart.** The
+questions were written from each note's own vocabulary, so a query that
+paraphrases a note without sharing any of its words is still untested.
+
+An earlier version of this table reported a gap between keyword queries (0.867)
+and natural-language ones (0.667). Re-measured on corrected ground truth, both
+phrasings score 1.00 — so that gap was at least partly an artifact of the old
+ground truth, which pointed at transcripts, and a transcript of everything is
+exactly the document a keyword query finds and a paraphrase misses.
+
+The underlying limitation is unchanged: this is lexical retrieval, and lexical
+retrieval is only as good as the vocabulary overlap between question and note.
+Four alternatives were tried against the older set — proximity (`NEAR`) matching,
+coverage as a score multiplier, title/tags weighted in BM25, and AND-first with
+an OR fallback — and none beat coverage-first re-ranking. Paraphrase robustness
+is what embeddings buy, and this project deliberately does not ship a model on
+the hot path. If your queries are paraphrases rather than terms, you want a
+vector index — and you should measure it, because the difference is not obvious
+from the outside.
 
 ## What it deliberately does not do
 
 - **No embeddings, no vector search.** FTS5 plus trigram covers thousands of
   notes without a model, a GPU, or a download.
-- **No LLM calls.** Summarising belongs to the agent.
+- **No LLM calls.** Summarising belongs to the agent — see
+  [Feeding it: distilling sessions](#feeding-it-distilling-sessions) for the
+  workflow that does it, including the batch cap and the register note.
 - **No proprietary database format.** If SQLite disappeared tomorrow, the `.md`
   files are still yours.
 - **No cloud, no account, no sync.** It is a folder. Sync it with whatever you
@@ -372,7 +580,7 @@ This project was designed and written in collaboration between a human
   "delete the database must not be a loss" and "the server never calls an LLM".
 - **The agent** wrote essentially all of the code, the tests, and this
   documentation, and found and fixed the four concurrency and index bugs
-  documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#bugs-found-only-at-runtime).
+  documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#8-bugs-found-only-at-runtime).
 
 It seems more useful to say that plainly than to pretend otherwise. Note also
 that copyright in AI-generated material is unsettled in several jurisdictions

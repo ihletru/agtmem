@@ -40,7 +40,10 @@ TOOLS = [
         "description": (
             "Search long-term memory (hybrid FTS5 + trigram, RRF-merged). "
             "Returns short snippets with ids. Superseded notes are excluded. "
-            "Use this first when resuming work on a project."
+            "Raw session transcripts are excluded too — they are input, not "
+            "knowledge, and at ~20 kB they match nearly every query. Set "
+            "sessions=true to include them. Use this first when resuming work "
+            "on a project."
         ),
         "inputSchema": {
             "type": "object",
@@ -53,6 +56,11 @@ TOOLS = [
                     "description": "restrict to one note type",
                 },
                 "limit": {"type": "integer", "default": 10},
+                "sessions": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "include raw session transcripts in the results",
+                },
             },
             "required": ["query"],
         },
@@ -230,6 +238,7 @@ def _t_search(args: dict) -> str:
         scope=args.get("scope"),
         note_type=args.get("type"),
         limit=int(args.get("limit") or 10),
+        include_sessions=bool(args.get("sessions")),
     )
     if not rows:
         return f"No results for {query!r}."

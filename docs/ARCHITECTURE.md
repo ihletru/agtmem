@@ -175,13 +175,28 @@ fused with RRF. The FTS query is an OR of prefix-matched tokens, which is
 deliberately recall-oriented: precision is not this stage's job.
 
 **Stage 2 — precision.** Candidates are re-ordered by how many *distinct query
-terms* they actually contain, with the fused score as the tie-break.
+terms* they contain per unit of length, with the fused score as the tie-break.
 
 Stage 2 exists because BM25 rewards a rare term heavily but does not reward
 matching *several* terms. Without it, a long note repeating one common word
-outranks a short note that answers the whole question. Measured effect: R@5 went
-from 0.600 to 0.667 — one case in fifteen, which is why it was measured rather
-than assumed.
+outranks a short note that answers the whole question. Measured effect, on the
+ground truth that has since been superseded: R@5 went from 0.600 to 0.667 — one
+case in fifteen, which is why it was measured rather than assumed.
+
+Counting terms alone was only half the fix, and the other half was found much
+later. *Presence* cannot distinguish a note that answers a question from a
+transcript that contains everything: a raw session (median 21 160 B) holds every
+query term simply by being long, so it beat the 2 321 B note that actually
+answered. The score is now
+
+    terms_matched / (1 + log2(max(1, size / COVERAGE_FREE_BYTES)))
+
+— full credit at or below `COVERAGE_FREE_BYTES`, logarithmic above it. Log rather
+than linear for the same reason BM25 saturates: the tenth repetition of a word
+adds nothing. The penalty is *relative*, so it cannot hide a genuinely relevant
+long document — a 35 kB register that really does match more of the question than
+anything else still wins. It only stops length from being mistaken for relevance.
+See §7 for the before/after numbers and how the constant was chosen.
 
 Matching in stage 2 is prefix-tolerant (`term[:max(4, len-2)]`), so "derived"
 still credits "derive". That is a cheap stand-in for a stemmer, which FTS5 does
@@ -198,7 +213,8 @@ not ship.
   `ONSOLE_FILL` returns 0 hits from FTS and 4 from the trigram index.
 
 Note the asymmetry: the stopword and trigram changes moved R@5 by *zero*
-(0.600 → 0.600) and were kept anyway on separate, direct evidence. See §7.
+(0.600 → 0.600, on the retired ground truth — see §7) and were kept anyway on
+separate, direct evidence. See §7.
 
 ## 5. Concurrency
 
@@ -258,38 +274,76 @@ never presented as a measured provider count.
 
 ### What the numbers actually said
 
-Measured on a 92-note store of real project session summaries, 15 cases, ground
-truth established by grepping the corpus for a distinctive phrase rather than by
-reading search results:
+Measured on a 275-note store (183 distilled notes plus 92 raw transcripts), 20
+scored cases, ground truth established by grepping the corpus for a distinctive
+phrase rather than by reading search results:
 
 | | R@5 | P@5 |
 |---|---|---|
-| `agtmem` | 0.667 | 0.147 |
-| grep | 0.533 | 0.120 |
+| `agtmem` | 1.00 | 0.21 |
+| grep | 0.05 | 0.01 |
 
-Split by phrasing, over the same 15 answers: **0.867 for term-style queries**,
-**0.667 for natural-language ones**. The gap is the finding. Lexical retrieval
-works when the query shares vocabulary with the note; it degrades on paraphrase,
-because the answering note may contain only two of the five words asked about.
+P@5 is bounded by the fact that most questions have exactly one right answer, so
+0.2 is the ceiling; it is reported because a metric that can only rise is not a
+metric.
 
-Four alternative strategies were implemented and measured. All plateaued at
-0.667 on natural language (proximity `NEAR`, coverage as a multiplier, title
-weighting at 0.600, AND-first at 0.533). This is the expected outcome —
-paraphrase robustness is what embeddings buy, and this project deliberately does
-not put a model on the hot path. The honest conclusion is that the ceiling is
-structural, not a missing trick.
+**The two-layer split is the real finding.** An agent only ever reads distilled
+notes, so that is the layer the headline number covers — but the same search can
+be pointed at the raw transcripts with `--sessions`, and there the ranking used
+to collapse. A session has a median size of 21 160 B against 2 321 B for a note,
+so it contains every query term by construction and won on length:
 
-Two methodological rules this exercise produced:
+| with sessions in the pool | before | after the length penalty |
+|---|---|---|
+| correct note pushed out of the top 5 | 15/20 | 0/20 |
+| top result was a raw transcript | 17/20 | 0/20 |
+
+`COVERAGE_FREE_BYTES` was chosen from that sweep, not from intuition. The first
+value tried was the median note size (2 500 B), and it *lowered* knowledge-layer
+R@5 from 1.00 to 0.90 — because the notes that answer questions are the
+substantial ones, with a median of 3 488 B. Sweeping the reference against both
+metrics at once gives a plateau of 3 500–6 500 B where both are perfect; 5 000 B
+is the middle of it, so it has margin on either side rather than sitting on a
+cliff edge. That is the 97th percentile of note size: every ordinary note scores
+on coverage alone.
+
+An earlier version of this section reported R@5 = 0.667, with a gap between
+term-style queries (0.867) and natural-language ones (0.667). **Those numbers are
+superseded and were measured against ground truth that pointed at raw
+transcripts** — which is why the gap appeared at all: a transcript of everything
+is precisely the document a keyword query finds and a paraphrase misses.
+Re-measured on corrected ground truth, both phrasings score 1.00. Four
+alternative lexical strategies were tried against the older set (proximity
+`NEAR`, coverage as a multiplier, title weighting, AND-first) and none beat
+coverage-first re-ranking; that conclusion still stands on the design rationale
+rather than on the retired numbers.
+
+**The current set is at ceiling, which is its own limitation.** R@5 = 1.00 means
+it can no longer tell two good strategies apart, and the questions were written
+from each note's own vocabulary, so a paraphrase sharing no words with the note
+remains untested. Paraphrase robustness is what embeddings buy, and this project
+deliberately does not put a model on the hot path. The ceiling is structural.
+
+Three methodological rules this exercise produced:
 
 1. **Ground truth must be independent of the thing being measured.** Deriving
    expected ids from `agtmem search` would have produced a meaningless 1.0.
-2. **Measure the change, not the intent.** Filtering stopwords and rebuilding the
-   trigram query moved R@5 by *zero* (0.600 → 0.600). The coverage re-ranking
-   moved it by +0.067. The trigram fix was kept anyway, on separate evidence:
-   mid-token fragments like `ONSOLE_FILL` return 0 hits from FTS and 4 from the
-   trigram index, and 0 from the old whole-query phrase. Principled changes can
-   be worth keeping even when the aggregate metric does not move — but you have
-   to know that is what you are doing.
+2. **Ground truth must point at something search can return.** Two ways to write
+   a case that fails for the wrong reason: a raw session (excluded from search by
+   default) and a `superseded` note (hidden by default). Four of the first
+   draft's targets were superseded and had to be re-pointed at their successors.
+   `agtmem eval --add` now refuses both instead of writing the case.
+3. **A gap is not a miss.** A question no note answers is a distillation defect,
+   not a ranking defect, and averaging the two together produces a number that
+   describes neither. Gaps are marked with `!` and scored separately.
+
+Historical note on rule 2 in the older set: filtering stopwords and rebuilding
+the trigram query moved R@5 by *zero* (0.600 → 0.600), and the coverage
+re-ranking moved it by +0.067 — both measured on the retired ground truth. The
+trigram fix was kept anyway, on separate evidence: mid-token fragments like
+`ONSOLE_FILL` return 0 hits from FTS and 4 from the trigram index, and 0 from the
+old whole-query phrase. Principled changes can be worth keeping even when the
+aggregate metric does not move — but you have to know that is what you are doing.
 
 ## 8. Bugs found only at runtime
 
@@ -347,15 +401,28 @@ depends on nothing.
 
 Stated plainly, because a design document that only lists strengths is marketing:
 
-- **Retrieval quality is measured, and the ceiling is lexical.** R@5 = 0.667 on
-  natural-language questions against a 0.533 grep baseline; 0.867 on term-style
-  queries. Paraphrase-heavy queries are the known weak case, and four alternative
-  lexical strategies were measured without closing the gap. See §7.
-- **The eval set is small.** 15 cases. Enough to falsify a claim and to compare
-  strategies against each other, not enough to trust a third decimal place.
+- **The ceiling is lexical, and the eval can no longer see it.** R@5 = 1.00 on
+  the current 20 cases, against a 0.05 grep baseline. That number is at ceiling,
+  so it cannot discriminate two good strategies, and it says nothing about
+  queries that paraphrase a note without sharing its vocabulary. Four alternative
+  lexical strategies were measured against the retired set without closing that
+  gap. See §7.
+- **The eval set is small and partly self-fulfilling.** 20 scored cases, two of
+  which are known coverage gaps, and the questions were written from each note's
+  own vocabulary. Enough to falsify a claim and to catch a ranking regression,
+  not enough to trust a third decimal place.
+- **The ground truth was wrong once and nothing caught it.** It pointed at raw
+  transcripts for a day, which made the metric measure the wrong layer and then
+  read 0.0 the moment sessions were excluded. The `--add` guard now rejects the
+  two structural mistakes, but a wrong-but-valid target is still possible.
 - **No distillation pipeline.** Imported session summaries are raw. Converting
   them into `decisions` and `bugs` is agent work, and there is no automation for
   it.
+- **Consolidation can leave a paragraph in the wrong note.** A duplicated
+  sentence in an off-topic note was found while auditing the eval set; it was
+  ranking first for a question it does not answer. Nothing in the tool detects
+  this — the duplicate-body check hashes whole files, so a single shared
+  paragraph passes.
 - **Symbol extraction is regex-based** and will miss generated or dynamic
   symbols.
 - **Single-writer performance.** The lock serialises writes across processes.

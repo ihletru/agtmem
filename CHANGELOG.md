@@ -4,6 +4,99 @@ All notable changes to this project. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Length no longer counts as relevance in re-ranking.** Stage 2 scored a
+  candidate by how many distinct query terms it *contains*, which cannot tell a
+  note that answers a question from a transcript that contains everything: a raw
+  session (median 21 160 B) holds every query term by construction, so it beat
+  the 2 321 B note that actually answered. Coverage is now divided by a
+  logarithmic length penalty — `terms / (1 + log2(size / 5000))`.
+  `COVERAGE_FREE_BYTES = 5000` came from a sweep against two metrics at once
+  (knowledge-layer R@5, and correct-note survival with sessions left in the
+  pool), which gives a plateau of 3 500–6 500 B; 5 000 is the middle of it, so it
+  has margin on both sides. The first value tried was the median note size
+  (2 500 B) and it *lowered* R@5 to 0.90, because the notes that answer questions
+  are the substantial ones. 5 000 B is the 97th percentile of note size, so
+  ordinary notes score on coverage alone. With sessions in the pool: correct note
+  pushed out of the top 5 went from 15/20 to **0/20**, and top-1 transcripts from
+  17/20 to **0/20**. Knowledge-layer R@5 is unchanged at 1.00.
+- **Raw sessions are excluded from search by default** (`--sessions` /
+  `sessions: true` to include them). A session is the transcript a note was
+  distilled from — input, not knowledge — and at ~20 kB it is about ten times
+  the size of a note, so BM25 hands it the top of every result list. Measured on
+  a store with 92 sessions among 275 notes: all ten results for a build question
+  were raw transcripts; with the exclusion, the first result is the note that
+  answers it. The filter is applied in SQL, not after ranking, so sessions
+  cannot eat the recall budget.
+
+### Added
+
+- **The eval separates a retrieval miss from a coverage gap.** A line beginning
+  with `!` in `eval.txt` records a question no note answers. Those are counted
+  separately and excluded from R@5, because no amount of ranking work can return
+  a note that was never written — averaging the two together produces a number
+  that describes neither failure. `agtmem eval --add-gap "question"` writes one.
+- **`agtmem eval --add` refuses ground truth that search can never return**: a
+  note id that does not exist, or one that is `superseded` (hidden from search by
+  default). Both look exactly like a retrieval bug once the case is in the file,
+  so they are rejected at the moment of writing. Four of the first draft's
+  targets turned out to be superseded.
+- **The eval set was re-pointed at distilled notes.** Ground truth had pointed at
+  raw `session-*` ids, which made it measure the wrong layer and then read 0.0
+  the moment sessions were excluded. The set is now 20 scored cases plus two
+  known coverage gaps, every target verified to be an active note.
+- **README: "Two layers, measured separately"** — the knowledge-layer number and
+  the transcript-layer number, why they differ, and the before/after table.
+- **README: "What this eval does not measure"** — the set is at R@5 = 1.00 and
+  therefore cannot discriminate between strategies; the questions were written
+  from each note's own vocabulary, so a zero-overlap paraphrase is still untested.
+- **README: "Raw sessions are not knowledge"** — why the exclusion exists and
+  what it costs to leave it out. Also documents the measurement above.
+- **README: "Feeding it: distilling sessions" — the missing half of the loop.**
+  `ingest-sessions` fills the store with raw summaries and nothing in the tool
+  turns them into `decisions/`, `facts/` and `bugs/`; rule 2 forbids the server
+  from calling an LLM, so that step belongs to the agent. The new section
+  documents the two stages (distillation, then consolidation), the measured
+  4.2-notes-per-session density and why an uncapped run just relocates the
+  problem, the append-only register note used to mark processed sessions
+  (a custom frontmatter key does not survive a save), and a scheduled-job
+  configuration with its batch cap. Documentation only; no code change.
+
+### Fixed
+
+- **The retrieval numbers in the README and `docs/ARCHITECTURE.md` described an
+  eval that was measuring the wrong layer.** They reported R@5 = 0.667 with a
+  term-style/natural-language split of 0.867/0.667. Re-measured on corrected
+  ground truth both phrasings score 1.00, so that gap was at least partly an
+  artifact of ground truth pointing at raw transcripts — a transcript of
+  everything being precisely what a keyword query finds and a paraphrase misses.
+  The retired figures are marked as superseded rather than deleted, and the
+  conclusion that survives (paraphrase robustness needs embeddings) is now
+  stated on its design rationale instead of on those numbers.
+- **Tests: 57 → 67.** New coverage for the length penalty (a long note with
+  identical term coverage must not outrank the short note that answers) and for
+  the eval's gap accounting and `--add` guard.
+
+- **A session timestamp in the project directory name became the note's scope.**
+  WorkBuddy names ad-hoc project directories after the workspace *plus* the
+  moment the session started (`c-Users-milo-WorkBuddy AI-2026-09-04-11-43-59`),
+  and `scope_from_dir()` took the last two slug segments — so nine sessions
+  landed in a scope called `43-59`, a bucket indistinguishable from a real
+  project in `agtmem stats`. A trailing timestamp is now stripped before the
+  last segments are chosen, so that directory yields `workbuddy-ai`. Seven cases
+  added to the test suite. Existing notes had to be re-scoped by hand; the store
+  does not rewrite scope on its own.
+- **README: the WorkBuddy example silently produced a server with zero tools.**
+  WorkBuddy exposes no tools for a stdio server whose config entry omits the
+  `args` key — the server still starts and still answers `tools/list` correctly,
+  it just never reaches the agent. The example now carries `"args": []`, and the
+  WorkBuddy section documents the trust gate, the config hash, and how to tell
+  the four failure modes apart. Configuration and documentation only; no code
+  change.
+
 ## [0.1.0] — 2026-09-15
 
 First public release.
@@ -65,7 +158,8 @@ assuming the design worked. Details and numbers in
   via RRF; stage 2 re-orders them by how many distinct query terms they contain.
   BM25 rewards a rare term but not matching *several* terms, so without stage 2 a
   long note repeating one common word outranks a short note that answers the
-  whole question. Measured: R@5 0.600 → 0.667.
+  whole question. Measured: R@5 0.600 → 0.667 (on ground truth since superseded
+  — see [Measured](#measured) below).
 - **Stopwords are dropped before building the FTS query.** The query is an OR, so
   every function word widens the pool with noise. The list covers English and
   Polish.
@@ -96,6 +190,13 @@ assuming the design worked. Details and numbers in
   Tests: 42 → 44.
 
 ### Measured
+
+> **Superseded 2026-09-16.** These figures were measured against ground truth
+> that pointed at raw session transcripts rather than distilled notes, so they
+> describe the wrong layer and are not comparable with the current numbers. Kept
+> as a record of what was believed at the time. Current figures: see
+> [Unreleased](#unreleased) and
+> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#7-measuring).
 
 On a 92-note store of real session summaries, 15 cases with ground truth
 established by grepping the corpus (not by reading search results):
