@@ -600,6 +600,98 @@ def main() -> int:
     except OSError:
         pass
 
+    print("\n--- the counter: parsing, joining, and the two controls ---")
+    import measure_usage as usage
+
+    # The log is the counter's only input, and it has two schemas in it: lines from
+    # before `sess=` and `ids=` existed, and lines after. Both must parse.
+    synth = os.path.join(RUNTIME_TMP, "synthetic.log")
+    with open(synth, "w", encoding="utf-8") as fh:
+        fh.write(
+            "2026-09-16 09:00:00 [workbuddy-ai] query='x' cw=1/1 need=1 rows=1 kept=1\n"
+            "2026-09-16 09:00:01 [workbuddy-ai] INJECT event=UserPromptSubmit 500c "
+            "prompt='legacy line, no session and no ids'\n"
+            "2026-09-16 09:00:02 [workbuddy-ai] silent event=UserPromptSubmit "
+            "prompt='ok'\n"
+            "2026-09-16 09:00:03 [workbuddy-ai] INJECT event=UserPromptSubmit 900c "
+            "sess=abc12345 ids=a,b,c prompt='three notes'\n"
+            "2026-09-16 09:00:04 [workbuddy-ai] INJECT event=UserPromptSubmit 1200c "
+            "sess=abc12345 ids=- prompt='nothing to name'\n"
+            "not a log line at all\n"
+        )
+    evs = usage.parse_log(synth)
+    check("parse_log keeps prompt events and drops the rest", len(evs) == 4, str(len(evs)))
+    check("parse_log reads a line with no sess= and no ids=",
+          evs[0]["sess"] == "" and evs[0]["ids"] == [] and evs[0]["kind"] == "inject")
+    check("parse_log separates silent from inject", evs[1]["kind"] == "silent")
+    check("parse_log splits ids on the comma and keeps the session",
+          evs[2]["ids"] == ["a", "b", "c"] and evs[2]["sess"] == "abc12345",
+          str(evs[2]))
+    check("parse_log treats ids=- as no ids", evs[3]["ids"] == [], str(evs[3]))
+
+    # The measured production fact: the transcript record is written 1-19 s BEFORE the
+    # hook fires. A forward-only window dropped 5 of 11 injections while looking like
+    # "no answer found" — so the window has to reach backwards, and stay narrow enough
+    # to refuse a match from a different turn.
+    base = 1_700_000_000.0
+    convo = [(int(base * 1000), "user",
+              "<user_query>po co zrobilismy agtmem?</user_query>"),
+             (int((base + 5) * 1000), "assistant", "odpowiedz")]
+    check("find_turn joins a record written BEFORE the hook",
+          usage.find_turn(convo, {"ts": base + 10, "prompt": "po co zrobilismy agtmem?"}) == 0)
+    check("find_turn refuses a match fifteen minutes away",
+          usage.find_turn(convo, {"ts": base + 900, "prompt": "po co zrobilismy agtmem?"}) is None)
+
+    check("stem_hit matches an inflected form the model would paraphrase into",
+          usage.stem_hit("magazynu", "magazynach"))
+    check("stem_hit does not stem a term shorter than STEM+1",
+          not usage.stem_hit("magazi", "magazynach"))
+    # The counter's own first test caught this: WORD_RE admits `.` inside a token so
+    # that `hooks.json` survives, which means a sentence period rides along on the
+    # last word of every sentence — a term the store can never contain.
+    check("tokens strips the sentence period that WORD_RE glues on",
+          "notatkę" in usage.tokens("Wstrzykuje notatkę. hook wspólny"),
+          str(usage.tokens("Wstrzykuje notatkę. hook wspólny")))
+    check("tokens keeps a dotted identifier and a relative path whole",
+          "hooks.json" in usage.tokens("patrz hooks.json oraz ./gradlew"),
+          str(usage.tokens("patrz hooks.json oraz ./gradlew")))
+    check("the marker regex accepts the id with or without its type prefix",
+          usage.MARKER.findall("a [agtmem:fact/one-two] b [agtmem:three]")
+          == ["one-two", "three"], str(usage.MARKER.findall("a [agtmem:fact/one-two] b [agtmem:three]")))
+
+    df = usage.Counter({"wstrzykuje": 2, "hook": 50})
+    terms = usage.trace_terms("Wstrzykuje notatkę. hook wspólny",
+                              "co wstrzykuje?", "hook omówiony wcześniej", df, 3)
+    check("trace_terms drops a term the prompt already contains",
+          "wstrzykuje" not in terms, str(terms))
+    check("trace_terms drops a term too common in the store", "hook" not in terms, str(terms))
+    check("trace_terms keeps a distinctive term never said before",
+          "notatkę" in terms, str(terms))
+
+    # `replay` has to hand back both halves, because the second half is the only
+    # matched control available: same query, same gate, not injected.
+    rows = [{"id": f"n{i}", "terms": 5} for i in range(5)]
+    with fake_search(rows):
+        injected, gated = usage.replay("jak dziala wstrzykiwanie notatek")
+    check("replay returns the head the hook would inject",
+          injected == [f"n{i}" for i in range(hook.KEEP)], str(injected))
+    check("replay returns everything that passed the gate, so gate-minus-injected "
+          "is a matched control",
+          gated == [f"n{i}" for i in range(5)] and set(gated) - set(injected), str(gated))
+    with fake_search([{"id": "keep", "terms": 9}, {"id": "weak", "terms": 0}]):
+        injected, gated = usage.replay("jak dziala wstrzykiwanie notatek")
+    check("replay excludes rows that fail the hook's gate", gated == ["keep"], str(gated))
+    with fake_search(rows):
+        check("replay declines a prompt with nothing to search on",
+              usage.replay("no") == ([], []))
+    check("reconstruct_ids is the injected half of replay",
+          usage.reconstruct_ids.__doc__ and "upper bound" in usage.reconstruct_ids.__doc__)
+
+    try:
+        os.remove(synth)
+    except OSError:
+        pass
+
     print("\n--- latency ---")
     fresh()
     t = time.perf_counter()

@@ -247,27 +247,60 @@ block is truncated line by line and an instruction that vanishes whenever the no
 long would make the counter read zero and look like model indifference. Turn it off with
 `"cite": false` in the sidecar — the block then returns to exactly what it was.
 
-**Arm 2 — lexical trace, with a null.** For each injection, take the terms of the
+**Arm 2 — lexical trace, with two nulls.** For each injection, take the terms of the
 injected excerpt that the model *could only have learned from the note* — distinctive in
 the store (present in ≤ `--df-max` notes), absent from the prompt, absent from everything
 said earlier in the conversation — and check whether they appear in the answer. Then run
-the same test over notes that were **not** injected, against the same answer text.
+the same test twice more, against the same answer text:
 
-**Measured on the first day (2026-09-16, six injected notes carrying ids):**
+* **near control** — notes the *same query* gated in and did **not** inject. Same topic,
+  same vocabulary profile; the only difference is that they never reached the model. This
+  is the arm that matters, because it is the only one that can separate "the note arrived"
+  from "this store always sounds like this".
+* **far control** — random notes from the store. It cannot isolate anything, and is
+  printed precisely to show why: this store is one topic, so even an unrelated note
+  overlaps the answer.
 
-| matcher | measured | control | reading |
+Both controls are counted **per injection**, the same unit as the measurement. Comparing a
+per-injection rate against a per-note rate flatters the measurement purely by giving it
+more chances to hit — which is what the first version of this counter did.
+
+**Measured on 2026-09-16, the first day the hook worked** (17 injections whose notes could
+be identified, 42 injected notes):
+
+| arm | measured | control | reading |
 | --- | --- | --- | --- |
-| exact | 0 / 6 | 3–6% | no power — the model paraphrases and does not reuse rare words |
-| six-character stem | 3 / 6 (50%) | 20–29% | ~2× the null at n=6: suggestive, not evidence |
+| 1 — declared `[agtmem:<id>]` | 0 / 42 notes; 0 / 16 in the window where the instruction was live | binary | the block reaches the model and the marker is still never written |
+| 2 — exact match | 0 / 6 | 3–6% | no power — the model paraphrases, it does not reuse rare words |
+| 2 — six-character stem | 10 / 17 (59%) | near **57%**, far 50% | **no separation — the instrument is seeing coincidence** |
 
-So arm 2 is a **null detector**, not a measurement: if the control is not clearly below
-the measured rate, believe nothing. Neither arm can show that a note *changed* the
-outcome — a trace is necessary evidence, not sufficient.
+The honest reading of that last row: **nothing here demonstrates that an injected note
+reaches the answer.** The near control reads 57% against a 59% measurement, and a control
+at more than half the measurement is not a null, it is a second measurement. The reason is
+structural rather than a tuning problem: notes the query gated in are *about the same
+subject as the answer*, so they share its vocabulary whether or not they were injected. A
+lexical trace cannot distinguish "this note was read" from "this topic was discussed".
+
+Measuring *effect* therefore needs a different instrument than a vocabulary proxy —
+something the answer could only know from the note, such as a specific number, filename or
+commit hash placed in a note and asked about. That is a canary test, and it is not built
+yet. Until it is, arm 1's zero and arm 2's non-separation are the whole truth: delivery is
+proven, effect is not.
+
+Arm 1 deserves its own sentence, because its zero is not the same kind of zero. The block
+demonstrably reaches the model (it arrives as a `<system-reminder data-role="hook">` block
+ahead of the prompt), the instruction is in it, and the marker has never once been written.
+An instruction inside injected context reads as reference material, not as an order. That is
+information about the contract, not about the notes.
 
 Two limits to state plainly. It only sees injections made after `sess=` was added
 (earlier lines are resolved by prompt text and marked `~` as guesses), and injected
 context is **not** persisted in the transcript — which is exactly why the hook logs what
-it sent.
+it sent. `--reconstruct` replays the hook's own selection to recover `ids=` for lines
+written before the hook logged them; it self-checks against the lines that do carry ids
+and currently reproduces 3 of 9 exactly, so treat a reconstructed set as an upper bound.
+It also has to be able to see the note at all, so `--reconstruct` is only as good as the
+store's current index against a prompt from hours ago.
 
 ## Tests
 
@@ -275,9 +308,8 @@ it sent.
 python test_agtmem_inject.py
 ```
 
-157 checks, no dependencies beyond the standard library and an `agtmem` that can
-be imported. The suite is hermetic: it points `AGTMEM_HOOK_RUNTIME` at a
-temporary directory *before* importing the hook, so it never touches the live log
+177 checks, no dependencies beyond the standard library and an `agtmem` that can
+be imported. The suite is hermetic: it points `AGTMEM_HOOK_RUNTIME` at atemporary directory *before* importing the hook, so it never touches the live log
 or state. Getting that wrong once meant a verification call silenced a note for a
 real prompt.
 
