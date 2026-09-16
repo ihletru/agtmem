@@ -408,6 +408,16 @@ Dependencies point one way: `cli` and `mcp_server` depend on `store`, `index`,
 `anatomy`, `ingest`, `eval`. Nothing depends on `cli` or `mcp_server`. `store`
 depends on nothing.
 
+`integrations/` sits outside that graph on purpose. It holds **consumers**, not
+parts of the store: code that reads the store and does something with it in a
+different product. It may import `agtmem`; nothing in `agtmem/` may import it.
+The distinction matters because §10 excludes hooks from the core — that exclusion
+is about where the responsibility lives, not about whether reading the store at
+the right moment is worth solving. `integrations/workbuddy/` is one answer to it:
+a hook that searches the store on prompt submit and appends the hits to the
+context, so a question about *why* arrives with the relevant note attached. It
+carries its own README, its own tests, and no machine-specific paths.
+
 ## 10. What was deliberately excluded
 
 - **Embeddings / vector search.** The high-frequency-path argument in §1.
@@ -428,6 +438,16 @@ Stated plainly, because a design document that only lists strengths is marketing
   queries that paraphrase a note without sharing its vocabulary. Four alternative
   lexical strategies were measured against the retired set without closing that
   gap. See §7.
+- **`search --json` does not say *how* a term matched.** A hit reports `terms`,
+  `coverage` and `score`, but not which terms matched, nor whether a match was a
+  whole word or a substring. The trigram index means a short token matches inside
+  longer identifiers, so `doc` matches `documentId` and `hook` matches
+  `paddleWebhook`, and a consumer gating on `terms` counts those as evidence. A
+  hook built on this API had to compensate by dropping short query tokens
+  (measured: it keeps recall and removes the noise, but it is a workaround).
+  Exposing document frequency or the match kind per hit would let a consumer
+  require one *rare* whole-word term instead. See
+  `integrations/workbuddy/README.md`.
 - **The eval set is small and partly self-fulfilling.** 20 scored cases, two of
   which are known coverage gaps, and the questions were written from each note's
   own vocabulary. Enough to falsify a claim and to catch a ranking regression,

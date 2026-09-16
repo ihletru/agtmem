@@ -1,0 +1,6 @@
+{
+  "repo": "/path/to/agtmem",
+  "store": "/path/to/agtmem-store",
+  "runtime": "/path/to/hook-runtime",
+  "python": "/path/to/python"
+}

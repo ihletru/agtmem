@@ -1,0 +1,10 @@
+# Written by install_hooks.py on the machine that installs the hook: it records
+# the paths that cannot be derived at run time. Machine-specific by nature.
+agtmem_inject.config.json
+
+# Runtime artifacts. They normally live in the runtime directory
+# (~/.workbuddy/hooks), never here — these entries only matter if someone points
+# AGTMEM_HOOK_RUNTIME at this directory.
+agtmem-inject.log
+agtmem-inject-state.json
+*.tmp

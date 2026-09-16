@@ -567,6 +567,29 @@ from the outside.
   files are still yours.
 - **No cloud, no account, no sync.** It is a folder. Sync it with whatever you
   already use.
+- **No hooks, and no code that reads the store on your behalf.** Deciding *when*
+  to consult memory is the agent's job, not the store's — the store does not sit
+  in the loop. Consumers that do sit in the loop live in
+  [`integrations/`](#integrations) and are shipped separately from the core.
+
+## Integrations
+
+Consumers of the store, kept outside the package: they may import `agtmem`,
+nothing in `agtmem/` may import them.
+
+### [`integrations/workbuddy/`](integrations/workbuddy/README.md) — hits injected on every prompt
+
+WorkBuddy spawns the CodeBuddy CLI, which has a hook system. This hook runs on
+`UserPromptSubmit`, searches the store with the prompt's content words, and
+appends the best hits to the context *before* the model sees the prompt — so a
+question about *why* arrives with the relevant note already attached, instead of
+depending on the agent deciding to go looking. It also emits a one-line reminder
+on `SessionStart`.
+
+It is the answer to the failure this project exists to fix: the store was being
+written to automatically and read never. What it is *not* is a relevance oracle —
+the README states plainly what the gate can and cannot do, with the measurements
+behind each decision.
 
 ## Credits and prior art
 
