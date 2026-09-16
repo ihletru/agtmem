@@ -167,20 +167,28 @@ def reindex(verbose: bool = False) -> dict:
 RECALL = 60
 
 # The size a note may reach before its term coverage starts being discounted.
-# Measured, not guessed, and the measurement mattered: the first value tried was
-# the median note size (2 500 B) and it *lowered* eval R@5 from 1.00 to 0.90,
-# because the notes that actually answer questions are the substantial ones —
-# their median is 3 488 B, not 2 321 B.
 #
-# Sweeping the reference against two metrics at once (knowledge-layer R@5, and
-# how many correct notes a raw session pushes out of the top 5) gives a plateau
-# of 3 500–6 500 B where both are perfect. 5 000 B is the middle of it, so it has
-# margin on both sides instead of sitting on a cliff edge. In distributional
-# terms that is the 97th percentile of note size: every ordinary note scores on
-# coverage alone, and only transcript-scale documents are discounted. A raw
-# session (median 21 160 B) is 4.2x this, the distillation register (35 104 B)
-# is 7.0x.
-COVERAGE_FREE_BYTES = 5000
+# Measured, not guessed, and the measurement mattered twice. The first value
+# tried was the median note size (2 500 B) and it *lowered* eval R@5 from 1.00 to
+# 0.90, because the notes that actually answer questions are the substantial ones
+# (median 3 488 B, p99 ~6 000 B).
+#
+# The second constraint is subtler and was found the hard way. The penalty is a
+# single knob with two requirements pulling against each other:
+#
+#   * it must be weak enough that better coverage still wins — a 6.5 kB note
+#     matching five query terms has to beat a 4.2 kB note matching four, or the
+#     penalty is overriding evidence, which is the same mistake as the length
+#     bias it exists to fix;
+#   * it must be strong enough that a raw session (median 21 160 B, matches
+#     nearly every term by being a transcript of everything) still loses.
+#
+# Sweeping both at once puts the usable window at roughly 5 500–6 500 B; 6 000 is
+# its middle. The window is narrow, which is a fair criticism of a one-parameter
+# curve — the honest statement is that this value is tuned to a measured corpus,
+# not derived. Re-measure it if your notes are much larger or much smaller than
+# 2–6 kB.
+COVERAGE_FREE_BYTES = 6000
 
 # Function words carry no retrieval signal, and because the FTS query is an OR,
 # every one of them widens the candidate pool with noise. Measured effect on the
@@ -307,6 +315,13 @@ def _coverage(
     reason BM25 saturates — the difference between a 2 kB and a 20 kB note matters
     far more than the difference between 20 kB and 40 kB, and the tenth repetition
     of a word adds nothing.
+
+    The penalty must stay *weak* at note scale, and getting that wrong is easy: an
+    earlier value let a 4.2 kB note matching four query terms outrank a 6.5 kB note
+    matching five, because the discount overcame better evidence. Coverage has to
+    remain the signal; the penalty only decides between candidates that matched the
+    same terms. See COVERAGE_FREE_BYTES for the two-sided constraint and the
+    measured window.
 
     Note the penalty is *relative*, so it cannot hide a genuinely relevant long
     note: a 35 kB document that really does match more of the question than

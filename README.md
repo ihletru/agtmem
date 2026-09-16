@@ -522,6 +522,15 @@ pool:
 | | before | after |
 |---|---|---|
 | correct note pushed out of the top 5 | 15/20 | **0/20** |
+
+The discount has to be gentle at note scale, and that is the part worth knowing
+if you build something similar: it is one knob with two opposing requirements.
+Too strong, and it overrides better evidence — a 4.2 kB note matching four query
+terms must not outrank a 6.5 kB note matching five. Too weak, and a transcript
+starts winning again. The usable window measured out at 5 500–6 500 B, which is
+narrow. Sorting by term count first with length as a tie-break looks like the
+obvious fix and is wrong: it repairs the first case and re-breaks the second,
+because a transcript matches *more* distinct terms than a note does.
 | top result was a raw transcript | 17/20 | **0/20** |
 
 ### What this eval does not measure

@@ -415,6 +415,24 @@ def main() -> int:
         check("the long note is still returned, just lower",
               "warp-core-log" in top, top[:300])
 
+        # The opposite failure, and the subtler one: the discount must stay weak
+        # enough that better coverage still wins. At COVERAGE_FREE_BYTES = 5000 it
+        # did not — a ~4 kB note matching four terms beat a ~6 kB note matching
+        # five, purely because the discount overcame better evidence. That is the
+        # same mistake as the length bias, only smaller. Deliberately a separate
+        # vocabulary, so the notes above cannot decide the ranking instead.
+        run(home, "add", "--title", "Dilithium containment spec",
+            "--type", "fact", "--scope", "t",
+            "--body", "dilithium crystal matrix containment field " * 145)
+        run(home, "add", "--title", "Crystal matrix overview",
+            "--type", "fact", "--scope", "t",
+            "--body", "dilithium crystal matrix containment " * 78)
+
+        top = run(home, "search",
+                  "dilithium crystal matrix containment field").stdout
+        check("more coverage beats a smaller note",
+              top.strip().startswith("dilithium-containment-spec"), top[:300])
+
         # ------------------------------------------------------------ eval
         print("\n[13] the eval separates retrieval misses from coverage gaps")
         run(home, "add", "--title", "Borg transwarp conduit notes",

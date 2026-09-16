@@ -301,11 +301,32 @@ so it contains every query term by construction and won on length:
 `COVERAGE_FREE_BYTES` was chosen from that sweep, not from intuition. The first
 value tried was the median note size (2 500 B), and it *lowered* knowledge-layer
 R@5 from 1.00 to 0.90 — because the notes that answer questions are the
-substantial ones, with a median of 3 488 B. Sweeping the reference against both
-metrics at once gives a plateau of 3 500–6 500 B where both are perfect; 5 000 B
-is the middle of it, so it has margin on either side rather than sitting on a
-cliff edge. That is the 97th percentile of note size: every ordinary note scores
-on coverage alone.
+substantial ones, with a median of 3 488 B and a p99 near 6 000 B.
+
+There is a second constraint, and it was found the hard way. The penalty is one
+knob with two requirements pulling against each other:
+
+- **Weak enough that better coverage still wins.** At 5 000 B the discount was
+  strong enough that a 4.2 kB note matching *four* query terms outranked a 6.5 kB
+  note matching *five*. That is the same class of mistake as the length bias the
+  penalty exists to fix, only smaller: an artefact of size overriding evidence.
+- **Strong enough that a transcript still loses.** A raw session (median
+  21 160 B) matches nearly every term by construction.
+
+Sweeping all three checks at once — knowledge-layer R@5, correct-note survival
+with sessions in the pool, and "does the note with more coverage win" — puts the
+usable window at **5 500–6 500 B**, with 6 000 in the middle. Below it the
+coverage check fails; above it a transcript starts winning again. The window is
+narrow, and that is a fair criticism of a single-parameter curve: the honest
+statement is that this value is tuned to a measured corpus, not derived. If your
+notes are much larger or much smaller than 2–6 kB, re-measure it.
+
+Note also what did *not* work, because it looks like the obvious fix: sorting
+lexicographically by term count first and length second. It fixes the coverage
+case and immediately re-breaks the transcript case (correct notes pushed out of
+the top 5 went from 0/20 back to 12/20), because a transcript matches *more*
+distinct terms than a note does. The two signals have to be combined in one
+score, not ranked in sequence.
 
 An earlier version of this section reported R@5 = 0.667, with a gap between
 term-style queries (0.867) and natural-language ones (0.667). **Those numbers are

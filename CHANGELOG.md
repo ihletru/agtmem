@@ -13,16 +13,22 @@ All notable changes to this project. Format follows
   note that answers a question from a transcript that contains everything: a raw
   session (median 21 160 B) holds every query term by construction, so it beat
   the 2 321 B note that actually answered. Coverage is now divided by a
-  logarithmic length penalty — `terms / (1 + log2(size / 5000))`.
-  `COVERAGE_FREE_BYTES = 5000` came from a sweep against two metrics at once
-  (knowledge-layer R@5, and correct-note survival with sessions left in the
-  pool), which gives a plateau of 3 500–6 500 B; 5 000 is the middle of it, so it
-  has margin on both sides. The first value tried was the median note size
-  (2 500 B) and it *lowered* R@5 to 0.90, because the notes that answer questions
-  are the substantial ones. 5 000 B is the 97th percentile of note size, so
-  ordinary notes score on coverage alone. With sessions in the pool: correct note
-  pushed out of the top 5 went from 15/20 to **0/20**, and top-1 transcripts from
-  17/20 to **0/20**. Knowledge-layer R@5 is unchanged at 1.00.
+  logarithmic length penalty — `terms / (1 + log2(size / 6000))`.
+  `COVERAGE_FREE_BYTES = 6000` sits in the middle of a **measured window of
+  5 500–6 500 B**, and the window is narrow because the one knob has to satisfy
+  two opposing requirements: weak enough that a 6.5 kB note matching five query
+  terms still beats a 4.2 kB note matching four, and strong enough that a 21 kB
+  transcript still loses. Below the window the first check fails (at 5 000 B the
+  smaller, worse-coverage note won); above it the second does (at 7 000 B a
+  transcript pushed a correct note out of the top 5). Two earlier values were
+  wrong in opposite directions: the median note size (2 500 B) *lowered*
+  knowledge-layer R@5 to 0.90, because the notes that answer questions are the
+  substantial ones (median 3 488 B), and sorting lexicographically by term count
+  with length as tie-break fixed the coverage case while re-breaking the
+  transcript case (0/20 → 12/20), since a transcript matches more distinct terms
+  than a note does. With sessions in the pool: correct note pushed out of the
+  top 5 went from 15/20 to **0/20**, and top-1 transcripts from 17/20 to **0/20**.
+  Knowledge-layer R@5 is unchanged at 1.00.
 - **Raw sessions are excluded from search by default** (`--sessions` /
   `sessions: true` to include them). A session is the transcript a note was
   distilled from — input, not knowledge — and at ~20 kB it is about ten times
