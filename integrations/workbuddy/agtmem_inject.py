@@ -650,6 +650,7 @@ def build_query(prompt: str, transcript: str = "") -> dict:
         return query, need, rows, kept
 
     query, need, rows, kept = attempt(query_terms)
+    effective = query_terms
 
     added = 0
     if not kept and transcript:
@@ -657,12 +658,17 @@ def build_query(prompt: str, transcript: str = "") -> dict:
         extra = [w for w in query_words(content_words(recent_context(transcript)))
                  if w.lower() not in seen]
         if extra:
-            wide_query, wide_need, wide_rows, wide_kept = attempt(query_terms + extra)
+            wide_terms = query_terms + extra
+            wide_query, wide_need, wide_rows, wide_kept = attempt(wide_terms)
             if wide_kept:
                 query, need, rows, kept = wide_query, wide_need, wide_rows, wide_kept
-                added = len(extra)
+                effective = wide_terms
+                # What actually went into the query, not how many words the
+                # transcript offered: the cap drops most of them, and a log that
+                # says 46 when 11 were sent is a log that lies.
+                added = max(0, len(wide_terms[:MAX_QUERY_WORDS]) - len(query_terms))
 
-    return {"terms": query_terms, "need": need, "query": query,
+    return {"terms": effective[:MAX_QUERY_WORDS], "need": need, "query": query,
             "rows": rows, "kept": kept, "added": added}
 
 
