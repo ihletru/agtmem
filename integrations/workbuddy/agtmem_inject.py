@@ -96,6 +96,8 @@ TERM_RATIO = 0.3        # ... and a share of the prompt's content words
 MIN_QUERY_CHARS = 4     # query tokens below this are not evidence (see query_words)
 MAX_QUERY_WORDS = 12    # long prompts get truncated, not rejected
 MAX_BLOCK_CHARS = 2600  # ~650 tokens; the note heads, not just their titles
+TRANSCRIPT_TAIL_BYTES = 200_000  # read the tail; a long transcript is tens of MB
+CONTEXT_TURNS = 6       # how many recent messages count as "the conversation"
 BODY_CHARS = 700        # excerpt taken from one note's body (~180 tokens)
 BODY_LINES = 7          # ... and at most this many of its lines
 MIN_TAIL_CHARS = 60     # below this much room, stop rather than emit a stub line
@@ -143,6 +145,9 @@ NOTE_HEAD_RE = re.compile(r"^- [a-z]+/(\S+)")   # a bullet in the emitted block
 FRONTMATTER_RE = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n", re.S)
 SENTENCE_END_RE = re.compile(r"[.!?\u2026](?=\s|$)")
 TABLE_SEP_RE = re.compile(r"^\|?[\s|:-]+\|?$")   # `|---|---|` in a Markdown table
+# A user turn in the transcript carries the injected context around the actual ask.
+# Only the ask is evidence about what the conversation is working on.
+USER_QUERY_RE = re.compile(r"<user_query>(.*?)</user_query>", re.S)
 
 
 # --------------------------------------------------------------------------- #
@@ -552,30 +557,128 @@ def note_excerpt(path: str | None, limit: int = BODY_CHARS) -> str:
     return "\n".join(out)
 
 
-def build_context(prompt: str, cwd: str = "", session_id: str = "") -> str | None:
+def recent_context(path: str, turns: int = CONTEXT_TURNS) -> str:
+    """The text of the last few messages, newest first.
+
+    A production prompt is often three words — "działaj", "rób licznik", "co musimy
+    zrobić żeby działało?" — and three words cannot say what the conversation is
+    about. Measured on 2026-09-16: the search then returns notes that share those
+    three words and answer nothing, while the note that actually answers the question
+    sits unretrieved. The transcript says what we are working on, and every
+    UserPromptSubmit payload carries its path.
+
+    Newest first, deliberately: the caller appends these terms after the prompt's and
+    then caps the query, so the freshest words must come first or the cap eats them.
+
+    Read the tail, never the whole file. An 18 MB transcript is normal here and a
+    hook has milliseconds.
+    """
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - TRANSCRIPT_TAIL_BYTES))
+            raw = fh.read()
+    except OSError:
+        return ""
+
+    lines = raw.split(b"\n")
+    if size > TRANSCRIPT_TAIL_BYTES:
+        lines = lines[1:]        # the first line is a truncated record, not JSON
+    msgs: list[str] = []
+    for line in lines:
+        if b'"message"' not in line:
+            continue
+        try:
+            rec = json.loads(decode_payload(line))
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != "message":
+            continue
+        if rec.get("role") not in ("user", "assistant"):
+            continue
+        content = rec.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "\n".join(b.get("text", "") for b in content
+                             if isinstance(b, dict) and isinstance(b.get("text"), str))
+        else:
+            continue
+        quoted = USER_QUERY_RE.search(text)
+        if quoted:               # a user turn carries injected context around the ask
+            text = quoted.group(1)
+        if text.strip():
+            msgs.append(text)
+    return "\n".join(reversed(msgs[-turns:]))
+
+
+def build_query(prompt: str, transcript: str = "") -> dict:
+    """The terms to search on, the gate they imply, and what came back.
+
+    Prompt terms first. The conversation is a **fallback, never a replacement**, and
+    that is deliberate: a short prompt is often not a query at all — "a ile dokładnie?"
+    is one usable term, and "co musimy zrobić żeby działało?" is three, which the gate
+    turns into "all three or nothing". Measured with the canary harness: such prompts
+    injected 0 of 5 times, and 5 of 5 once the transcript supplied the topic. But a
+    prompt that already works must keep its own query, because re-ranking on
+    conversation terms would let a note that merely echoes the last few minutes
+    outrank the note that answers the question. So the transcript is consulted only
+    when the prompt alone gated nothing in — the trigger is the gate, not the prompt's
+    length, since a long prompt can gate nothing in too.
+
+    Lives here rather than inside `build_context` because the canary harness needs the
+    same query, and a second copy of this rule is a second place for it to drift.
+
+    Returns `{terms, need, query, rows, kept, added}`.
+    """
+    query_terms = query_words(content_words(prompt))
+
+    def attempt(terms: list[str]) -> tuple[str, int, list, list]:
+        """One search, gated. `need` comes from the terms actually sent — the rule
+        that fixed the long-prompt bug, where a 367-word prompt demanded 111 matched
+        terms and was therefore silently never injected."""
+        if len(terms) < 2:
+            return "", 0, [], []
+        query = " ".join(terms[:MAX_QUERY_WORDS])
+        need = required_terms(terms)
+        rows = search(query)
+        kept = [r for r in rows
+                if isinstance(r, dict) and int(r.get("terms") or 0) >= need]
+        return query, need, rows, kept
+
+    query, need, rows, kept = attempt(query_terms)
+
+    added = 0
+    if not kept and transcript:
+        seen = {w.lower() for w in query_terms}
+        extra = [w for w in query_words(content_words(recent_context(transcript)))
+                 if w.lower() not in seen]
+        if extra:
+            wide_query, wide_need, wide_rows, wide_kept = attempt(query_terms + extra)
+            if wide_kept:
+                query, need, rows, kept = wide_query, wide_need, wide_rows, wide_kept
+                added = len(extra)
+
+    return {"terms": query_terms, "need": need, "query": query,
+            "rows": rows, "kept": kept, "added": added}
+
+
+def build_context(prompt: str, cwd: str = "", session_id: str = "",
+                  transcript: str = "") -> str | None:
     """UserPromptSubmit: return the notes to inject, or None to stay silent."""
     if not prompt or prompt.lstrip().startswith("/"):
         return None
     if ACK_RE.match(prompt.strip()):
         return None
 
-    words = content_words(prompt)
-    query_terms = query_words(words)
-    if len(query_terms) < 2:
-        log(f"skip: {len(query_terms)} usable content words of {len(words)}")
-        return None
-
-    query = " ".join(query_terms[:MAX_QUERY_WORDS])
-    need = required_terms(query_terms)
-    rows = search(query)
-    if not rows:
-        log(f"no rows for {query!r}")
-        return None
-
-    kept = [r for r in rows if isinstance(r, dict) and int(r.get("terms") or 0) >= need]
-    log(f"query={query!r} cw={len(query_terms)}/{len(words)} need={need} "
-        f"rows={len(rows)} kept={len(kept)}")
-    if not kept:
+    found = build_query(prompt, transcript)
+    query, need, rows, kept = (found["query"], found["need"], found["rows"], found["kept"])
+    log(f"query={query!r} cw={len(found['terms'])}/{len(content_words(prompt))} "
+        f"ctx={found['added']} need={need} rows={len(rows)} kept={len(kept)}")
+    if not rows or not kept:
         return None
 
     scope = scope_from_cwd(cwd)
@@ -720,12 +823,13 @@ def main() -> int:
     prompt = str(payload.get("prompt") or "")
     cwd = str(payload.get("cwd") or "")
     session_id = str(payload.get("session_id") or "")
+    transcript = str(payload.get("transcript_path") or "")
 
     try:
         if event == "SessionStart":
             context = build_session_context(cwd, session_id)
         elif event == "UserPromptSubmit":
-            context = build_context(prompt, cwd, session_id)
+            context = build_context(prompt, cwd, session_id, transcript)
         else:
             log(f"ignored event={event}")
             return 0

@@ -600,6 +600,128 @@ def main() -> int:
     except OSError:
         pass
 
+    print("\n--- a thin prompt is finished by the conversation ---")
+
+    # The production failure, measured 2026-09-16: "a ile dokładnie?" is a single
+    # usable term, so the hook returned None before it ever searched and stayed silent
+    # on every short follow-up. The canary harness read 0/5 injected that way and 5/5
+    # once the transcript was used. The payload has carried `transcript_path` all
+    # along; the hook simply never looked at it.
+    transcript = os.path.join(RUNTIME_TMP, "synthetic-transcript.jsonl")
+    now_ms = int(time.time() * 1000)
+    with open(transcript, "w", encoding="utf-8") as fh:
+        for rec in (
+            {"type": "message", "role": "user", "sessionId": "s",
+             "timestamp": now_ms - 2000,
+             "content": [{"type": "text",
+                          "text": "<user_query>przegladam limit kredytow w portfelu"
+                                  "</user_query>"}]},
+            {"type": "function_call_result", "name": "Bash",
+             "content": [{"type": "text", "text": "CANARY 4217 in a tool result"}]},
+            {"type": "message", "role": "assistant", "sessionId": "s",
+             "timestamp": now_ms - 1000,
+             "content": [{"type": "text", "text": "Sprawdzam to w magazynie."}]},
+        ):
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    text = hook.recent_context(transcript)
+    check("recent_context reads the conversation", "limit kredytow" in text, repr(text[:120]))
+    check("recent_context skips tool results, which are not the conversation",
+          "4217" not in text, repr(text[:120]))
+    check("recent_context puts the newest message first, so the query cap keeps it",
+          text.index("Sprawdzam") < text.index("limit kredytow"), repr(text[:120]))
+    check("recent_context degrades on a missing path rather than raising",
+          hook.recent_context("") == "" and hook.recent_context(os.path.join(
+              RUNTIME_TMP, "nope.jsonl")) == "")
+
+    def capture(prompt: str, transcript_path: str = "",
+                rows: list | None = None) -> tuple[str, str | None]:
+        """The query the hook *ended up* sending, with the store faked out.
+
+        The last query, not the first: the fallback makes a second search, and the
+        first one is the attempt that failed.
+        """
+        fake = rows if rows is not None else [{"id": "n1", "terms": 99}]
+        seen: list[str] = []
+        real = hook.search
+        hook.search = lambda q: (seen.append(q), [dict(r) for r in fake])[1]
+        try:
+            fresh()
+            ctx = hook.build_context(prompt, session_id="probe",
+                                     transcript=transcript_path)
+        finally:
+            hook.search = real
+        return (seen[-1] if seen else ""), ctx
+
+    query, ctx = capture("a ile dokladnie?", transcript)
+    check("a thin prompt borrows its query from the conversation",
+          "limit" in query and "kredytow" in query, repr(query))
+    check("...and the block still gets built", bool(ctx and "[agtmem]" in ctx))
+
+    query, _ = capture("a ile dokladnie?")
+    check("with no transcript a thin prompt still stays silent",
+          query == "", repr(query))
+
+    query, _ = capture("jak zbudowac APK androida bez gradlew w tym projekcie",
+                       transcript)
+    check("a prompt that already retrieves keeps its own query",
+          "kredytow" not in query and "portfelu" not in query, repr(query))
+
+    # The fallback has to trigger on the gate, not on prompt length: a prompt can be
+    # long and still gate nothing in, and that is the case the transcript is for.
+    weak = [{"id": "n1", "terms": 0}, {"id": "n2", "terms": 1}]
+    query, _ = capture("jak zbudowac APK androida bez gradlew w tym projekcie",
+                       transcript, rows=weak)
+    check("a prompt that gates nothing in falls back to the conversation",
+          "kredytow" in query, repr(query))
+    query, _ = capture("jak zbudowac APK androida bez gradlew w tym projekcie",
+                       "", rows=weak)
+    check("...and stays silent when there is no conversation to fall back on",
+          query == "" or "kredytow" not in query, repr(query))
+
+    # `build_query` exists so the query rule lives in exactly one place. The canary
+    # harness had its own copy and drifted the moment the rule changed — it kept
+    # calling a constant that no longer existed, and `--diagnose` crashed while the
+    # hook itself was fine. Diagnose with the hook's own builder or not at all.
+    real_search = hook.search
+    hook.search = lambda q: [{"id": "n1", "terms": 99}]
+    try:
+        found = hook.build_query("a ile dokladnie?", transcript)
+    finally:
+        hook.search = real_search
+    check("build_query returns the documented shape",
+          set(found) == {"terms", "need", "query", "rows", "kept", "added"},
+          str(sorted(found)))
+    check("build_query falls back to the conversation for a thin prompt",
+          "kredytow" in found["query"], repr(found["query"]))
+    canary_src = ""
+    try:
+        with open(os.path.join(HERE, "canary_test.py"), encoding="utf-8") as fh:
+            canary_src = fh.read()
+    except OSError:
+        pass
+    check("the canary diagnoses with the hook's builder, not a private copy",
+          "hook.build_query(" in canary_src and "MIN_PROMPT_TERMS" not in canary_src)
+
+    # The wiring, not the function: the path has to arrive from the payload.
+    payload = json.dumps({"prompt": "a ile dokladnie?", "cwd": "",
+                          "session_id": "sess-thin", "transcript_path": transcript,
+                          "hook_event_name": "UserPromptSubmit"}, ensure_ascii=False)
+    rc, out, _err = run_process(payload)
+    logged = ""
+    try:
+        with open(hook.LOG, encoding="utf-8") as fh:
+            logged = fh.read()
+    except OSError:
+        pass
+    check("the payload's transcript_path reaches the hook", rc == 0, f"rc={rc}")
+    check("the hook says in the log that it used the conversation",
+          "ctx=" in logged, repr(logged[-200:]))
+    try:
+        os.remove(transcript)
+    except OSError:
+        pass
+
     print("\n--- the counter: parsing, joining, and the two controls ---")
     import measure_usage as usage
 

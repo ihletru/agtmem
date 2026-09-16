@@ -222,13 +222,72 @@ decide", which is the right answer for an installed package.
 One sidecar key is not a path: `"cite"` (default `true`) controls whether the injected
 block asks the model to mark the notes it used. See the section below.
 
-## Does it work? `measure_usage.py`
+## Does it work? Two instruments, two questions
 
-Delivery was always measurable; *effect* was not, and an unfalsifiable claim of value is
-what let the pointer-only version look healthy for a day. The counter closes that:
+### The canary: does an injected note change the answer?
+
+Plant a fact that cannot be guessed, ask for it, and see whether it comes back. This is the
+only measurement here with an unambiguous reading.
 
 ```bash
-python measure_usage.py --day 2026-09-16 --verbose
+python canary_test.py --vague               # the production shape: thin follow-up + transcript
+python canary_test.py --vague --diagnose    # no model calls: where the note lands
+python canary_test.py --vague --no-context  # the behaviour before 2026-09-16
+```
+
+It clones the store into a temp directory, plants canary notes through the CLI, and runs
+three arms per canary:
+
+| arm | what it is | must read |
+| --- | --- | --- |
+| A | prompt + the block the hook would inject, wrapped as production wraps it | the canary |
+| B | prompt alone — **the null** | zero |
+| C | prompt + the block for a *different* canary | zero |
+
+Arm B reading non-zero means the canary is guessable and the run is void; arm C reading
+non-zero means the model filled the slot with something plausible. Either one invalidates
+the run, and the script says so instead of reporting a number.
+
+**Measured 2026-09-16, five canaries, two models (`openai/gpt-4o-mini` and
+`deepseek/deepseek-chat`):**
+
+| prompt shape | hook injected | arm A | arm B | arm C | cited |
+| --- | --- | --- | --- | --- | --- |
+| names the topic | 5/5 | 5/5 | 0/5 | 0/5 | 5/5 |
+| thin follow-up, no transcript | **0/5** | — | — | — | — |
+| thin follow-up, with transcript | 5/5 | 5/5 | 0/5 | 0/5 | 4/5 |
+
+So the pipe works: given a note that answers the question, the block puts it in the answer,
+and the value could not have come from anywhere else. The cite instruction works too — 5/5
+here against **0 of 42** in production, which is the first evidence that production's zero
+was about the *notes* being useless, not about the model ignoring instructions.
+
+### Why the thin follow-up injected nothing
+
+The hook searched on the prompt alone. A production prompt is often three words — "działaj",
+"rób licznik", "co musimy zrobić żeby działało?" — and three words retrieve notes that share
+those three words and answer nothing. Measured: **0 of 5**.
+
+Every `UserPromptSubmit` payload has carried `transcript_path` all along and the hook never
+looked at it. It does now, and the conversation is a **fallback, never a replacement**:
+
+1. search on the prompt and gate as before;
+2. only if that gates nothing in, search again on the prompt's terms plus the terms of the
+   last few messages.
+
+That order is deliberate. Re-ranking every prompt on conversation terms would let a note
+that merely echoes the last few minutes outrank the note that answers the question, so a
+prompt that already works keeps its own query. The fallback triggers on the *gate*, not on
+prompt length, because a long prompt can gate nothing in too.
+
+Cost: one search normally, two only in the case that used to fail silently.
+
+### The counter: a weaker question, answered honestly
+
+`measure_usage.py` counts whether the notes the hook injected show up in the answer:
+
+```bash
+python measure_usage.py --day 2026-09-16 --verbose --reconstruct
 ```
 
 It joins three sources — the hook log (`ids=`, `sess=`), the store's index (document
@@ -270,28 +329,25 @@ be identified, 42 injected notes):
 
 | arm | measured | control | reading |
 | --- | --- | --- | --- |
-| 1 — declared `[agtmem:<id>]` | 0 / 42 notes; 0 / 16 in the window where the instruction was live | binary | the block reaches the model and the marker is still never written |
+| 1 — declared `[agtmem:<id>]` | 0 / 42 notes | binary | production only; 5/5 on the canary, so the zero is about the notes |
 | 2 — exact match | 0 / 6 | 3–6% | no power — the model paraphrases, it does not reuse rare words |
 | 2 — six-character stem | 10 / 17 (59%) | near **57%**, far 50% | **no separation — the instrument is seeing coincidence** |
 
-The honest reading of that last row: **nothing here demonstrates that an injected note
-reaches the answer.** The near control reads 57% against a 59% measurement, and a control
-at more than half the measurement is not a null, it is a second measurement. The reason is
-structural rather than a tuning problem: notes the query gated in are *about the same
-subject as the answer*, so they share its vocabulary whether or not they were injected. A
-lexical trace cannot distinguish "this note was read" from "this topic was discussed".
+The honest reading of that last row: **a lexical trace cannot show that a note was read.**
+The near control reads 57% against a 59% measurement, and a control at more than half the
+measurement is not a null, it is a second measurement. The reason is structural rather than
+a tuning problem: notes the query gated in are *about the same subject as the answer*, so
+they share its vocabulary whether or not they were injected.
 
-Measuring *effect* therefore needs a different instrument than a vocabulary proxy —
-something the answer could only know from the note, such as a specific number, filename or
-commit hash placed in a note and asked about. That is a canary test, and it is not built
-yet. Until it is, arm 1's zero and arm 2's non-separation are the whole truth: delivery is
-proven, effect is not.
+So the counter is a **regression alarm**, not a proof of value. When you want to know
+whether the integration works, run the canary. The counter exists to notice the day the
+canary stops working.
 
-Arm 1 deserves its own sentence, because its zero is not the same kind of zero. The block
-demonstrably reaches the model (it arrives as a `<system-reminder data-role="hook">` block
-ahead of the prompt), the instruction is in it, and the marker has never once been written.
-An instruction inside injected context reads as reference material, not as an order. That is
-information about the contract, not about the notes.
+Arm 1's zero is not the same kind of zero as arm 2's. The block demonstrably reaches the
+model (it arrives as a `<system-reminder data-role="hook">` block ahead of the prompt), the
+instruction is in it, and in production the marker was never once written. The canary then
+showed the same instruction being honoured 5 times out of 5 — so the difference is not the
+instruction, it is whether there was anything in the block worth citing.
 
 Two limits to state plainly. It only sees injections made after `sess=` was added
 (earlier lines are resolved by prompt text and marked `~` as guesses), and injected
@@ -308,8 +364,9 @@ store's current index against a prompt from hours ago.
 python test_agtmem_inject.py
 ```
 
-177 checks, no dependencies beyond the standard library and an `agtmem` that can
-be imported. The suite is hermetic: it points `AGTMEM_HOOK_RUNTIME` at atemporary directory *before* importing the hook, so it never touches the live log
+192 checks, no dependencies beyond the standard library and an `agtmem` that can
+be imported. The suite is hermetic: it points `AGTMEM_HOOK_RUNTIME` at a
+temporary directory *before* importing the hook, so it never touches the live log
 or state. Getting that wrong once meant a verification call silenced a note for a
 real prompt.
 
