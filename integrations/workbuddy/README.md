@@ -107,6 +107,26 @@ then require at least one rare term matched as a whole word. Until then, treat a
 injected block as a *pointer*, not as an answer — `agtmem show <id>` before
 relying on it.
 
+### A second limitation, and it is the one that bites in practice
+
+**This hook is downstream of the distillation pipeline, so its usefulness can
+decay without a single failed event.** It searches the *distilled* layer — raw
+sessions are excluded from default search — which means the hook cannot inject
+anything that has not been harvested and distilled first. Measured over one day:
+nine sessions of real work sat unharvested while the hook kept firing and kept
+logging healthy lines. **A working hook is not evidence that its source is
+current.** Check the upstream feed before evaluating the hook:
+
+```bash
+python -m agtmem ingest-sessions --dry-run   # the only honest backlog count
+```
+
+The same day also showed an inverted selection effect worth knowing before tuning
+the gate: the maintenance job's prompt is built from the store's own vocabulary,
+so it is the conversation that gets an injection **most reliably** (4 of 4 runs) —
+and the injection is worthless there. Lexical proximity is anti-correlated with
+"needs recall" in exactly the two cases that matter most.
+
 ## Runtime files
 
 The log and the suppression state are **not** written beside this script. The
@@ -117,11 +137,25 @@ sidecar, overridable with `AGTMEM_HOOK_RUNTIME`.
 
 | File | Purpose |
 | --- | --- |
-| `agtmem-inject.log` | one line per event: the query, the gate decision, what was injected |
+| `agtmem-inject.log` | one line per event: the query, the gate decision, the ids injected |
 | `agtmem-inject-state.json` | repeat suppression, keyed per conversation |
 
 The log is the only way to see what the hook decided, because its stdout goes
-into the conversation context rather than to a terminal.
+into the conversation context rather than to a terminal. Read it as a funnel:
+
+```
+18:03:40  query='trochę pracowałem wiecej danych oceny systemu' cw=6/7 need=3 rows=6 kept=0
+18:03:40  silent event=UserPromptSubmit prompt='trochę już pracowałem, masz wiecej danych…'
+10:12:58  query='wypchnąłeś hook jego opis doc repo' cw=6 need=3 rows=6 kept=6
+10:12:58  INJECT event=UserPromptSubmit 333c ids=workbuddy-prompt-hook-injects-agtmem-hits prompt=…
+```
+
+`cw=` is content words used out of words seen, `need=` the gate, `rows=` what search
+returned, `kept=` what survived the gate. The `INJECT` line names the **ids actually
+emitted** — `kept` is not that set, because the character budget can still drop a
+candidate, and without the ids the question "was the right note delivered?" becomes
+unanswerable within `REPEAT_WINDOW` (45 min), when the suppression state that would
+have named them is pruned.
 
 Suppression is **per conversation**. It used to be global, which was a real bug:
 a note injected while answering one question was silenced when it was the right
@@ -149,7 +183,7 @@ decide", which is the right answer for an installed package.
 python test_agtmem_inject.py
 ```
 
-130 checks, no dependencies beyond the standard library and an `agtmem` that can
+135 checks, no dependencies beyond the standard library and an `agtmem` that can
 be imported. The suite is hermetic: it points `AGTMEM_HOOK_RUNTIME` at a
 temporary directory *before* importing the hook, so it never touches the live log
 or state. Getting that wrong once meant a verification call silenced a note for a

@@ -154,6 +154,23 @@ def main() -> int:
     check("block at most KEEP notes", bool(ctx) and ctx.count("\n- ") <= hook.KEEP,
           f"{ctx.count(chr(10) + '- ') if ctx else 0} bullets")
 
+    # The log has to name what was delivered. `kept=N` counts candidates that passed
+    # the gate, and the character budget can then drop some, so it is a different set —
+    # and the suppression state that would name them is pruned within REPEAT_WINDOW,
+    # which makes the ids unrecoverable by the next morning if they are not logged.
+    if ctx:
+        ids = hook.injected_ids(ctx)
+        check("injected_ids reads every bullet", len(ids) == ctx.count("\n- "),
+              f"{len(ids)} ids vs {ctx.count(chr(10) + '- ')} bullets")
+        check("injected_ids returns bare ids, not types or titles",
+              all(ids) and all("/" not in i and " " not in i for i in ids), repr(ids))
+        check("injected_ids finds nothing in a silent block",
+              hook.injected_ids("[agtmem] nic tu nie ma") == [])
+        check("injected_ids tolerates the truncation marker",
+              hook.injected_ids("- fact/one — a\n\u2026 (ucięte)") == ["one"])
+        check("injected_ids survives the updated-date suffix",
+              hook.injected_ids("- bug/two \u00b7 2026-09-16 — b") == ["two"])
+
     print("\n--- robustness: hostile prompts must not raise ---")
     hostile = [
         'he said "build the apk" without gradlew',

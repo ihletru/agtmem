@@ -127,6 +127,7 @@ ACK_RE = re.compile(r"^(ok|okay|tak|nie|dzieki|dziekuje|dobrze|jasne|pewnie|no|h
                     r"kontynuuj|dalej|go on|continue|yes|no)[.!?]*$", re.I)
 WORD_RE = re.compile(r"[0-9A-Za-z\u00c0-\u024f_+#./-]{3,}")
 HIGHLIGHT_RE = re.compile(r"\[([^\[\]]{0,60})\]")
+NOTE_HEAD_RE = re.compile(r"^- [a-z]+/(\S+)")   # a bullet in the emitted block
 
 
 # --------------------------------------------------------------------------- #
@@ -464,6 +465,26 @@ def query_words(words: list[str]) -> list[str]:
     return [w for w in words if len(w) >= MIN_QUERY_CHARS]
 
 
+def injected_ids(block: str) -> list[str]:
+    """The note ids that are actually in the emitted block.
+
+    ``kept=N`` counts candidates that passed the gate; the character budget can then
+    drop some of them, so it is not the same set. Reading the ids back out of the block
+    is the only way the log can say what the model really received — and without that,
+    "was the right note delivered?" is unanswerable the next morning, because the
+    suppression state that would have named them has been pruned by REPEAT_WINDOW.
+
+    The block's own format is the contract here (``- <type>/<id> [· <updated>]``), so
+    this stays a pure read of what was written rather than a second source of truth.
+    """
+    out: list[str] = []
+    for line in block.splitlines():
+        match = NOTE_HEAD_RE.match(line)
+        if match:
+            out.append(match.group(1))
+    return out
+
+
 def build_context(prompt: str, cwd: str = "", session_id: str = "") -> str | None:
     """UserPromptSubmit: return the notes to inject, or None to stay silent."""
     if not prompt or prompt.lstrip().startswith("/"):
@@ -618,7 +639,8 @@ def main() -> int:
         out = {"hookSpecificOutput": {"hookEventName": event,
                                       "additionalContext": context}}
         sys.stdout.write(json.dumps(out, ensure_ascii=False))
-        log(f"INJECT event={event} {len(context)}c prompt={prompt[:60]!r}")
+        log(f"INJECT event={event} {len(context)}c "
+            f"ids={','.join(injected_ids(context)) or '-'} prompt={prompt[:60]!r}")
     else:
         log(f"silent event={event} prompt={prompt[:60]!r}")
     return 0
