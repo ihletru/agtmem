@@ -46,7 +46,16 @@ Design rules, in order of importance:
    nothing: the model treats injected text as authoritative. The gate is tuned
    for precision, not recall — a miss costs nothing, because the agent can still
    run `agtmem search` itself.
-3. **Bounded cost.** <= 3 notes, <= 1200 chars of context, one search, 8 s cap.
+3. **Content, not pointers.** A note arrives with its head, not just its title.
+   The first version injected `- fact/<id> — <title>` plus a 110-character
+   snippet, which is a *pointer*: it leaves the agent to decide whether to run
+   `agtmem show <id>`. Measured over a full day, **none of the nine injections
+   was followed by a `show`** — the decision never happened, so the note was
+   delivered and never read, which is the exact failure this hook exists to fix.
+   The head of a note costs ~180 tokens and removes the decision.
+4. **Bounded cost.** <= 3 notes, <= 2600 chars of context (~650 tokens), one
+   search, 8 s cap. That is more than the pointer version cost, and still less
+   than the single `agtmem search --json` (1234 tokens) it replaces.
 
 The gate was tuned on a labelled prompt set (see `test_agtmem_inject.py`).
 `score` does NOT discriminate at all (irrelevant prompts score 0.0325-0.0328,
@@ -86,9 +95,12 @@ MIN_TERMS_FLOOR = 3     # absolute floor on matched content words
 TERM_RATIO = 0.3        # ... and a share of the prompt's content words
 MIN_QUERY_CHARS = 4     # query tokens below this are not evidence (see query_words)
 MAX_QUERY_WORDS = 12    # long prompts get truncated, not rejected
-MAX_BLOCK_CHARS = 1200
+MAX_BLOCK_CHARS = 2600  # ~650 tokens; the note heads, not just their titles
+BODY_CHARS = 700        # excerpt taken from one note's body (~180 tokens)
+BODY_LINES = 7          # ... and at most this many of its lines
+MIN_TAIL_CHARS = 60     # below this much room, stop rather than emit a stub line
 TITLE_CHARS = 84
-SNIPPET_CHARS = 110
+SNIPPET_CHARS = 110     # fallback when the note file cannot be read
 REPEAT_WINDOW = 45 * 60        # per conversation: note injected this recently
 SESSION_WINDOW = 12 * 60 * 60  # session reminders: once per session, for 12 h
 LOG_MAX_BYTES = 256 * 1024
@@ -128,6 +140,9 @@ ACK_RE = re.compile(r"^(ok|okay|tak|nie|dzieki|dziekuje|dobrze|jasne|pewnie|no|h
 WORD_RE = re.compile(r"[0-9A-Za-z\u00c0-\u024f_+#./-]{3,}")
 HIGHLIGHT_RE = re.compile(r"\[([^\[\]]{0,60})\]")
 NOTE_HEAD_RE = re.compile(r"^- [a-z]+/(\S+)")   # a bullet in the emitted block
+FRONTMATTER_RE = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n", re.S)
+SENTENCE_END_RE = re.compile(r"[.!?\u2026](?=\s|$)")
+TABLE_SEP_RE = re.compile(r"^\|?[\s|:-]+\|?$")   # `|---|---|` in a Markdown table
 
 
 # --------------------------------------------------------------------------- #
@@ -485,6 +500,52 @@ def injected_ids(block: str) -> list[str]:
     return out
 
 
+def note_excerpt(path: str | None, limit: int = BODY_CHARS) -> str:
+    """The head of a note's body, frontmatter stripped, as indented lines.
+
+    Delivering the content is the point of this revision. `search --json` returns
+    a `path` and a 110-character `snippet` but **not the body**, so the hook reads
+    the file itself — one local read per injected note, no second search.
+
+    The whole note cannot go in (median ~3 kB, mean ~9.8 kB, max 96 kB), but the
+    head can: by the store's own convention the first section is the essence. Lines
+    are indented so a Markdown bullet inside a note can never be mistaken for a
+    note header by `injected_ids()`. Headings keep their words and lose their `#`.
+
+    Returns "" when the file is unreadable, which makes the caller fall back to the
+    snippet — a hook must degrade, never fail.
+    """
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read(64 * 1024)
+    except OSError:
+        return ""
+
+    out: list[str] = []
+    used = 0
+    truncated = False
+    for raw in FRONTMATTER_RE.sub("", text, count=1).splitlines():
+        line = raw.strip().lstrip("#").strip()
+        if not line or TABLE_SEP_RE.match(line):    # `|---|---|` carries no content
+            continue
+        room = limit - used
+        if room < MIN_TAIL_CHARS or len(out) >= BODY_LINES:
+            truncated = True
+            break
+        if len(line) > room:
+            head = line[:room]
+            ends = [m.end() for m in SENTENCE_END_RE.finditer(head)]
+            line = (head[:ends[-1]] if ends else head.rstrip()) + " \u2026"
+            truncated = False                      # this line already says so
+        out.append("  " + line)
+        used += len(line)
+    if truncated and out:
+        out.append("  \u2026")                      # the note continues; say so
+    return "\n".join(out)
+
+
 def build_context(prompt: str, cwd: str = "", session_id: str = "") -> str | None:
     """UserPromptSubmit: return the notes to inject, or None to stay silent."""
     if not prompt or prompt.lstrip().startswith("/"):
@@ -527,15 +588,27 @@ def build_context(prompt: str, cwd: str = "", session_id: str = "") -> str | Non
 
     lines = [f"[agtmem] {len(fresh)} {plural(len(fresh))} w pamięci projektu "
              f"(pełna treść: `agtmem show <id>`):"]
+    bodies = 0
     for r in fresh:
         head = f"- {r.get('type')}/{r.get('id')}"
         if r.get("updated"):
             head += f" \u00b7 {r['updated']}"
         title = tidy(r.get("title"), TITLE_CHARS)
         lines.append(f"{head} \u2014 {title}" if title else head)
-        snip = tidy(r.get("snippet"), SNIPPET_CHARS)
-        if snip:
-            lines.append(f"  \u2026 {snip}")
+        body = note_excerpt(r.get("path"))
+        if body:
+            bodies += 1
+            lines.append(body)
+        else:
+            snip = tidy(r.get("snippet"), SNIPPET_CHARS)
+            if snip:
+                lines.append(f"  \u2026 {snip}")
+
+    # A silent downgrade to snippets would look exactly like a healthy injection,
+    # only ~6x smaller — which is how the pointer version went unnoticed for a day.
+    if bodies < len(fresh):
+        log(f"excerpt unavailable for {len(fresh) - bodies}/{len(fresh)} notes "
+            f"\u2014 snippet fallback")
 
     # Truncate on a line boundary so the block never ends mid-sentence.
     block_lines: list[str] = []

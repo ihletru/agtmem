@@ -16,6 +16,44 @@ The result is that a question about *why* — a decision, a bug's cause, somethi
 settled in an earlier session — arrives with the relevant note already attached,
 without the agent deciding to go looking.
 
+## What gets injected, and why it is content rather than a pointer
+
+Each hit arrives with **the head of the note itself**, not just its title:
+
+```
+[agtmem] 1 trafienie w pamięci projektu (pełna treść: `agtmem show <id>`):
+- fact/verbigem-release-pipeline-android-to-mini · 2026-09-15 — Wydanie Androida trafia na…
+  Kanał „strona" (APK do pobrania) i kanał „Play" (AAB) są niezależne i łatwo je rozjechać.
+  Pięć miejsc do podbicia
+  1. `android/app/build.gradle.kts` — `versionCode` / `versionName`.
+  2. `mini/vite.config.ts` — `ANDROID_VERSION_CODE` / `ANDROID_VERSION_NAME`. …
+```
+
+The first version of this hook injected `- fact/<id> — <title>` plus a
+110-character snippet. That is a **pointer**: it tells the agent a note exists
+and asks it to run `agtmem show <id>`. Over one measured day, **none of the nine
+injections was followed by a `show`** — the decision never happened, so every
+note was delivered and never read. That is the original failure this project
+exists to fix, merely moved one step later.
+
+Notes cannot be injected whole (median ~3 kB, mean ~9.8 kB, max 96 kB), but
+their head can, and by the store's own convention the first section is the
+essence. `search --json` returns a `path` but **not the body**, so the hook reads
+the file itself — one local read per injected note, no second search. Excerpts
+are indented, which is what keeps a Markdown bullet inside a note from being
+mistaken for a note header.
+
+| | pointer version | content version |
+| --- | --- | --- |
+| per note | ~30 tokens | ~180 tokens |
+| whole block | 105–284 tokens | **~250–520 tokens** |
+| one `agtmem search --json` it replaces | 1234 tokens | 1234 tokens |
+
+The cost is real and the trade is deliberate: a day of 33 prompts costs roughly
+20 k tokens of injected context, against 474 k tokens spent that same day on
+*maintaining* the store. The measurement lives in
+`~/.workbuddy-ai/skills/workbuddy-hooks/`.
+
 ## Install
 
 ```bash
@@ -147,15 +185,19 @@ into the conversation context rather than to a terminal. Read it as a funnel:
 18:03:40  query='trochę pracowałem wiecej danych oceny systemu' cw=6/7 need=3 rows=6 kept=0
 18:03:40  silent event=UserPromptSubmit prompt='trochę już pracowałem, masz wiecej danych…'
 10:12:58  query='wypchnąłeś hook jego opis doc repo' cw=6 need=3 rows=6 kept=6
-10:12:58  INJECT event=UserPromptSubmit 333c ids=workbuddy-prompt-hook-injects-agtmem-hits prompt=…
+10:12:58  INJECT event=UserPromptSubmit 2007c ids=workbuddy-prompt-hook-injects-agtmem-hits,… prompt=…
 ```
 
 `cw=` is content words used out of words seen, `need=` the gate, `rows=` what search
 returned, `kept=` what survived the gate. The `INJECT` line names the **ids actually
-emitted** — `kept` is not that set, because the character budget can still drop a
-candidate, and without the ids the question "was the right note delivered?" becomes
-unanswerable within `REPEAT_WINDOW` (45 min), when the suppression state that would
-have named them is pruned.
+emitted** and the byte count — `kept` is not the id set, because the character budget
+can still drop a candidate, and without the ids the question "was the right note
+delivered?" becomes unanswerable within `REPEAT_WINDOW` (45 min), when the suppression
+state that would have named them is pruned.
+
+A silent downgrade to snippets would look exactly like a healthy injection, only ~6×
+smaller — so when an excerpt cannot be read, the hook says so:
+`excerpt unavailable for 1/2 notes — snippet fallback`.
 
 Suppression is **per conversation**. It used to be global, which was a real bug:
 a note injected while answering one question was silenced when it was the right
@@ -183,7 +225,7 @@ decide", which is the right answer for an installed package.
 python test_agtmem_inject.py
 ```
 
-135 checks, no dependencies beyond the standard library and an `agtmem` that can
+148 checks, no dependencies beyond the standard library and an `agtmem` that can
 be imported. The suite is hermetic: it points `AGTMEM_HOOK_RUNTIME` at a
 temporary directory *before* importing the hook, so it never touches the live log
 or state. Getting that wrong once meant a verification call silenced a note for a

@@ -171,6 +171,44 @@ def main() -> int:
         check("injected_ids survives the updated-date suffix",
               hook.injected_ids("- bug/two \u00b7 2026-09-16 — b") == ["two"])
 
+    print("\n--- excerpt: the note's content, not just its title ---")
+    # The revision this section guards: the first version injected a pointer (title
+    # + 110-char snippet) and left the agent to run `agtmem show <id>`. Measured over
+    # a day, none of nine injections was followed by a show — the decision never
+    # happened, so the note was delivered and never read.
+    tmp_note = os.path.join(RUNTIME_TMP, "excerpt-note.md")
+    with open(tmp_note, "w", encoding="utf-8") as fh:
+        fh.write("---\nid: excerpt-note\ntitle: Tytu\u0142\nstatus: active\n---\n\n"
+                 "## Sekcja\n\nPierwsze zdanie faktu. Drugie zdanie faktu.\n\n"
+                 "| katalog | zawarto\u015b\u0107 |\n|---|---|\n| `facts/` | fakty |\n\n"
+                 "- punkt pierwszy\n- punkt drugi\n")
+    ex = hook.note_excerpt(tmp_note)
+    check("excerpt strips the frontmatter", "status: active" not in ex and "id: excerpt" not in ex,
+          repr(ex[:80]))
+    check("excerpt keeps the body", "Pierwsze zdanie faktu" in ex, repr(ex[:120]))
+    check("excerpt drops the heading markup but keeps its words",
+          "Sekcja" in ex and "##" not in ex, repr(ex[:80]))
+    check("excerpt drops table separator rows", "|---|" not in ex, repr(ex))
+    check("excerpt keeps table rows", "`facts/` | fakty" in ex, repr(ex))
+    check("every excerpt line is indented", all(l.startswith("  ") for l in ex.splitlines()),
+          repr(ex))
+    check("a Markdown bullet in a body cannot fake a note header",
+          hook.injected_ids(ex) == [], repr(hook.injected_ids(ex)))
+    check("excerpt respects the character limit",
+          len(hook.note_excerpt(tmp_note, limit=60)) <= 60 + len("  \u2026"),
+          f"{len(hook.note_excerpt(tmp_note, limit=60))} chars")
+    check("a truncated excerpt says so",
+          hook.note_excerpt(tmp_note, limit=60).rstrip().endswith("\u2026"),
+          repr(hook.note_excerpt(tmp_note, limit=60)))
+    check("a missing path degrades to empty, never raises",
+          hook.note_excerpt(os.path.join(RUNTIME_TMP, "nope.md")) == "")
+    check("a None path degrades to empty", hook.note_excerpt(None) == "")
+    check("the real block carries content, not only a pointer",
+          bool(ctx) and len(ctx) > 500 and "\n  " in ctx,
+          f"{len(ctx) if ctx else 0} chars")
+    check("the block still fits the cap", bool(ctx) and len(ctx) <= hook.MAX_BLOCK_CHARS,
+          f"{len(ctx) if ctx else 0} vs {hook.MAX_BLOCK_CHARS}")
+
     print("\n--- robustness: hostile prompts must not raise ---")
     hostile = [
         'he said "build the apk" without gradlew',
