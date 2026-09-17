@@ -814,6 +814,43 @@ def main() -> int:
     except OSError:
         pass
 
+    print("\n--- the cost counterfactual: what it may read, and what counts as an answer ---")
+
+    # savings_test is handed a real 27 GB repository and a model. The confinement is
+    # the entire safety story, so it is asserted rather than trusted.
+    import savings_test as savings
+
+    root = os.path.abspath(RUNTIME_TMP)
+    check("resolve accepts a path inside the workspace",
+          savings.resolve("sub/file.txt", root) == os.path.join(root, "sub", "file.txt"))
+    check("resolve accepts the workspace root itself",
+          savings.resolve(".", root) == root)
+    for escape in ("../outside.txt", "sub/../../outside.txt", "C:/Windows/system32"):
+        try:
+            savings.resolve(escape, root)
+            check(f"resolve refuses {escape!r}", False, "it was allowed through")
+        except savings.Escape:
+            check(f"resolve refuses {escape!r}", True)
+
+    # An arm that failed must not be counted as a saving, so "answered" has to be
+    # strict: every truth substring, and an empty answer is never a pass.
+    check("answered requires every truth substring",
+          savings.answered("numer to CZ-8814", ["cz-8814"]) is True)
+    check("answered rejects a partial match",
+          savings.answered("numer to CZ-8814", ["cz-8814", "play console"]) is False)
+    check("answered rejects an empty answer",
+          savings.answered("", ["cokolwiek"]) is False)
+    check("answered is case-insensitive",
+          savings.answered("WĄSIK", ["wąsik"]) is True)
+
+    # The caps decide how expensive arm B is, so they must stay named and visible.
+    check("the tool output caps are module constants",
+          all(isinstance(getattr(savings, name), (int, float)) for name in
+              ("GREP_MAX_MATCHES", "READ_MAX_LINES", "GREP_BUDGET_SECONDS")))
+    check("the tool set is read-only — no write or edit tool is exposed",
+          {t["function"]["name"] for t in savings.TOOLS} == {"grep", "read", "list_dir"},
+          str(sorted(t["function"]["name"] for t in savings.TOOLS)))
+
     print("\n--- latency ---")
     fresh()
     t = time.perf_counter()

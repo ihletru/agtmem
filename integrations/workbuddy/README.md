@@ -358,13 +358,106 @@ and currently reproduces 3 of 9 exactly, so treat a reconstructed set as an uppe
 It also has to be able to see the note at all, so `--reconstruct` is only as good as the
 store's current index against a prompt from hours ago.
 
+## What does it cost, and what does it save?
+
+The canary answers "does the note reach the answer". It does not answer the question
+the integration exists for: an agent should not spend time and tokens rediscovering
+what is already written down. That is a claim about cost, and `savings_test.py` is
+the counterfactual:
+
+```bash
+python savings_test.py --model openai/gpt-4o-mini
+```
+
+Same question, same tools, same system prompt, two arms:
+
+* **arm A** — the prompt plus the block the hook would inject
+* **arm B** — the prompt alone
+
+Arm B gets `grep`, `read` and `list_dir` over the real repository, so it can go and
+look. Every tool is workspace-confined and read-only. Token counts come from the
+API's own `usage` counters summed over every turn, because a tool result makes the
+*next* prompt bigger and that growth is half the cost being measured.
+
+The workspace is `~/verbigem`: **27 GB, 33 186 files**, and for the questions whose
+answer is history the fact sits inside a 46–73 KB memory log. The saving is not "the
+tokens the agent did not read" — without the store the agent does not know *which
+file* to read. What it pays instead is a search.
+
+### The price
+
+| | |
+| --- | --- |
+| block size | median **772 tokens** (2 383 characters) |
+| hook latency | **0.35 s**, including one store search |
+| paid on | every prompt where the hook injects |
+
+### The return, and the three classes it comes in
+
+Ten runs (2 repetitions × 5 questions, `openai/gpt-4o-mini`) split into three classes,
+and only the first is a saving. Averaging them together is how a cost measurement
+starts lying.
+
+The two repetitions are kept separate rather than averaged because **arm B gave
+different verdicts on the same question**: it found the answer on question 2 in the
+first run and failed on it in the second, at temperature 0. The tool loop is
+path-dependent — a different first `grep` leads somewhere else. A single run of this
+harness would have produced a confident number in either direction.
+
+| class | n | what it means |
+| --- | --- | --- |
+| both arms answered | 1 / 10 | the only like-for-like measurement |
+| only A answered | 7 / 10 | the store is the **only** place the fact exists |
+| A also missed | 2 / 10 | the block was off-topic: cost with no return |
+
+**The one clean pair** — the same question answered correctly by both arms:
+
+| | arm A | arm B |
+| --- | --- | --- |
+| tokens | 880 | 6 346 |
+| tool calls | **0** | **9** |
+| wall time | 1.1 s | 11.7 s |
+| saved | **5 466 tokens, 9 tool calls, 10.6 s** | |
+
+One data point is not a mean, and it is reported as one data point.
+
+**Across all ten runs, arm B answered correctly once.** It spent 743–5 509 tokens and
+2–9 tool calls per attempt and usually came back saying it could not find the fact —
+including on questions whose answer is sitting in the repository. The cost of a failed
+search is the same as the cost of a successful one, which is the part a "savings"
+table usually hides.
+
+**When the block is on target, arm A answers with zero tool calls** in 6 of its 7
+correct runs: ~1 000 tokens and ~2 s, against 2–9 tool calls and 4–15 s. The
+exception is instructive — one run needed 6 tool calls and 11 378 tokens even though
+the note was in front of it.
+
+### The reading
+
+**The per-prompt answer is a split, not an average.** On a prompt whose answer the
+store has and whose retrieval lands, the block buys back roughly **4 000–5 500 tokens
+and 8–10 tool calls**, for a price of ~772 tokens. On a prompt where retrieval misses,
+the block is a **pure cost**, and worse than a pure cost: arm A spent 4 746 tokens on
+3 tool calls and still answered wrongly, because a plausible-but-adjacent block makes
+the model search *and* mislead itself.
+
+So the variable that decides the sign is **retrieval precision**, not the size of the
+block. Tightening the block would not help a miss.
+
+Two limits worth stating. Arm B's 1/10 is partly a weak-model result — a stronger
+model searches better, and the *transferable* number is the cost per attempt (2–9
+tool calls, 0.7–5.5 k tokens), not the success rate. And the tool output caps
+(`GREP_MAX_MATCHES = 40`, `READ_MAX_LINES = 120`, a 25 s grep budget) decide how
+expensive arm B is, so they are constants in the file rather than incidental
+settings: an uncapped grep would make the store look magnificent.
+
 ## Tests
 
 ```bash
 python test_agtmem_inject.py
 ```
 
-192 checks, no dependencies beyond the standard library and an `agtmem` that can
+203 checks, no dependencies beyond the standard library and an `agtmem` that can
 be imported. The suite is hermetic: it points `AGTMEM_HOOK_RUNTIME` at a
 temporary directory *before* importing the hook, so it never touches the live log
 or state. Getting that wrong once meant a verification call silenced a note for a
