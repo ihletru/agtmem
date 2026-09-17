@@ -209,6 +209,55 @@ def main() -> int:
     check("the block still fits the cap", bool(ctx) and len(ctx) <= hook.MAX_BLOCK_CHARS,
           f"{len(ctx) if ctx else 0} vs {hook.MAX_BLOCK_CHARS}")
 
+    print("\n--- the excerpt must reach the answer, not just the note ---")
+    # The failure this section guards is one level below the pointer failure above,
+    # and it looked identical to a healthy injection. Taking the note's *head* was
+    # justified as "by the store's own convention the first section is the essence",
+    # which is false for a five-section note: the block carried
+    # `fact/firebase-identity-and-rules-model`, its id and its title, and none of its
+    # answer, because `affectedKeys().hasAny([...])` sits at character 2046 of 3289
+    # under a heading in section 3. The agent read the block, did not find the
+    # answer, searched the repository instead and answered `allow write: if false;`.
+    # So: the head, then every later heading with its lead line.
+    deep_note = os.path.join(RUNTIME_TMP, "deep-note.md")
+    with open(deep_note, "w", encoding="utf-8") as fh:
+        fh.write("---\nid: deep-note\ntitle: Tytu\u0142\nstatus: active\n---\n\n"
+                 + "Wst\u0119p bez znaczenia dla pytania. " * 12 + "\n\n"
+                 "## Pierwsza sekcja\n\nTresc pierwszej sekcji, nie odpowiedz.\n\n"
+                 "DRUGIE zdanie sekcji, ktore nie ma po co jechac w bloku.\n\n"
+                 "### Sekcja z odpowiedzi\u0105\n\n"
+                 "Regu\u0142a u\u017cywa `affectedKeys().hasAny([...])`.\n\n"
+                 "## Ostatnia sekcja\n\nJeszcze cos.\n")
+    deep = hook.note_excerpt(deep_note)
+    check("a heading below the head reaches the excerpt",
+          "Sekcja z odpowiedzi" in deep, repr(deep))
+    check("... and so does the lead line under it", "affectedKeys" in deep, repr(deep))
+    check("a later section is marked as a section",
+          hook.SECTION_MARK in deep and "##" not in deep, repr(deep))
+    check("the head is capped, so the sections are reached at all",
+          len(deep.splitlines()[0]) <= hook.HEAD_CHARS + len("  \u2026"), repr(deep[:90]))
+    check("a section's lead is kept", "Tresc pierwszej sekcji" in deep, repr(deep))
+    check("a section's second line is dropped — that is what pays for the reach",
+          "DRUGIE zdanie" not in deep, repr(deep))
+    check("an excerpt from one note stays inside BODY_CHARS",
+          len(hook.note_excerpt(deep_note, limit=400)) <= 400 + 3,
+          f"{len(hook.note_excerpt(deep_note, limit=400))} chars")
+    check("a note with no headings still yields its head",
+          "\u00a7" not in hook.note_excerpt(tmp_note), repr(hook.note_excerpt(tmp_note)))
+    check("BODY_CHARS covers the head plus several sections",
+          hook.BODY_CHARS >= hook.HEAD_CHARS + 4 * (hook.LEAD_CHARS + 20),
+          f"head {hook.HEAD_CHARS} + leads in {hook.BODY_CHARS}")
+
+    # The end-to-end form of the same claim: on the real store, the block for the
+    # question that exposed the defect must carry the string a correct answer needs.
+    # Substring sufficiency is checked without a model on purpose — if the block does
+    # not contain it, no model can answer from the block, and the failure is the block's.
+    deep_ctx = call("Jak nazywa si\u0119 wywo\u0142anie w regu\u0142ach Firestore w mini, "
+                    "kt\u00f3re chroni pola przed zapisem z klienta?")
+    check("the block for that question carries affectedKeys, not only a note title",
+          bool(deep_ctx) and "affectedKeys" in deep_ctx,
+          repr(deep_ctx)[:240] if deep_ctx else "no block at all")
+
     print("\n--- the counter's two handles: sess= and the cite line ---")
     # `sess=` makes an injection joinable with the answer that followed it; without it
     # measure_usage.py can only guess from the truncated prompt text. The cite line is

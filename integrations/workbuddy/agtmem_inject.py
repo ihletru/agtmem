@@ -46,16 +46,19 @@ Design rules, in order of importance:
    nothing: the model treats injected text as authoritative. The gate is tuned
    for precision, not recall — a miss costs nothing, because the agent can still
    run `agtmem search` itself.
-3. **Content, not pointers.** A note arrives with its head, not just its title.
-   The first version injected `- fact/<id> — <title>` plus a 110-character
-   snippet, which is a *pointer*: it leaves the agent to decide whether to run
-   `agtmem show <id>`. Measured over a full day, **none of the nine injections
-   was followed by a `show`** — the decision never happened, so the note was
-   delivered and never read, which is the exact failure this hook exists to fix.
-   The head of a note costs ~180 tokens and removes the decision.
-4. **Bounded cost.** <= 3 notes, <= 2600 chars of context (~650 tokens), one
-   search, 8 s cap. That is more than the pointer version cost, and still less
-   than the single `agtmem search --json` (1234 tokens) it replaces.
+3. **Content, not pointers.** A note arrives with its head and the titles of its
+   later sections, not just its title. The first version injected
+   `- fact/<id> — <title>` plus a 110-character snippet, which is a *pointer*: it
+   leaves the agent to decide whether to run `agtmem show <id>`. Measured over a
+   full day, **none of the nine injections was followed by a `show`** — the
+   decision never happened, so the note was delivered and never read, which is the
+   exact failure this hook exists to fix. Content removes the decision. The second
+   version carried the head only, which failed the same way one level down: the
+   block held the note's id and title and not its answer, and the agent improvised
+   instead of reading. See `note_excerpt`.
+4. **Bounded cost.** <= 3 notes, <= 3000 chars of context, one search, 8 s cap.
+   Measured median **797 tokens / 2311 characters** per injecting prompt, which is
+   still less than the single `agtmem search --json` (1234 tokens) it replaces.
 
 The gate was tuned on a labelled prompt set (see `test_agtmem_inject.py`).
 `score` does NOT discriminate at all (irrelevant prompts score 0.0325-0.0328,
@@ -99,11 +102,13 @@ MIN_QUERY_CHARS = 4     # query tokens below this are not evidence (see query_wo
 # and 16 is the smallest cap that satisfies all four. See MAX_QUERY_WORDS in the
 # module docstring's sibling note on `query_words`, and `--why` in savings_test.py.
 MAX_QUERY_WORDS = 16
-MAX_BLOCK_CHARS = 2600  # ~650 tokens; the note heads, not just their titles
+MAX_BLOCK_CHARS = 3000  # worst case; the measured median block is 797 tokens
 TRANSCRIPT_TAIL_BYTES = 200_000  # read the tail; a long transcript is tens of MB
 CONTEXT_TURNS = 6       # how many recent messages count as "the conversation"
-BODY_CHARS = 700        # excerpt taken from one note's body (~180 tokens)
-BODY_LINES = 7          # ... and at most this many of its lines
+HEAD_CHARS = 200        # of one note, how much of its opening prose to carry
+LEAD_CHARS = 100        # ... then one lead line under each later heading
+HEADING_CHARS = 90      # a section title's own cap
+BODY_CHARS = 1200       # the whole excerpt taken from one note, head included
 MIN_TAIL_CHARS = 60     # below this much room, stop rather than emit a stub line
 TITLE_CHARS = 84
 SNIPPET_CHARS = 110     # fallback when the note file cannot be read
@@ -149,6 +154,8 @@ NOTE_HEAD_RE = re.compile(r"^- [a-z]+/(\S+)")   # a bullet in the emitted block
 FRONTMATTER_RE = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n", re.S)
 SENTENCE_END_RE = re.compile(r"[.!?\u2026](?=\s|$)")
 TABLE_SEP_RE = re.compile(r"^\|?[\s|:-]+\|?$")   # `|---|---|` in a Markdown table
+HEADING_RE = re.compile(r"^#{1,4}\s+(.*)$")       # `## Sekcja` in a note body
+SECTION_MARK = "  \u00a7 "                        # a later section's title, in the block
 # A user turn in the transcript carries the injected context around the actual ask.
 # Only the ask is evidence about what the conversation is working on.
 USER_QUERY_RE = re.compile(r"<user_query>(.*?)</user_query>", re.S)
@@ -534,17 +541,59 @@ def injected_ids(block: str) -> list[str]:
     return out
 
 
+def _cut(line: str, room: int) -> str:
+    """Truncate a line to `room` characters, preferring a sentence boundary."""
+    head = line[:room]
+    ends = [m.end() for m in SENTENCE_END_RE.finditer(head)]
+    return (head[:ends[-1]] if ends else head.rstrip()) + " \u2026"
+
+
 def note_excerpt(path: str | None, limit: int = BODY_CHARS) -> str:
-    """The head of a note's body, frontmatter stripped, as indented lines.
+    """The head of a note, then every later heading with the line beneath it.
 
     Delivering the content is the point of this revision. `search --json` returns
     a `path` and a 110-character `snippet` but **not the body**, so the hook reads
     the file itself — one local read per injected note, no second search.
 
-    The whole note cannot go in (median ~3 kB, mean ~9.8 kB, max 96 kB), but the
-    head can: by the store's own convention the first section is the essence. Lines
-    are indented so a Markdown bullet inside a note can never be mistaken for a
-    note header by `injected_ids()`. Headings keep their words and lose their `#`.
+    The whole note cannot go in (median ~2.5 kB, max 96 kB), so something has to
+    be chosen, and *what* to choose was measured rather than assumed. The first
+    rule took the head — seven lines of prose — on the reasoning that "by the
+    store's own convention the first section is the essence". For a five-section
+    note that is false, and it failed silently: the block carried
+    `fact/firebase-identity-and-rules-model`, its id and its title, and none of its
+    answer, because `affectedKeys().hasAny([...])` sits at character 2046 of a
+    3289-character body, under the heading "Lista pól, których klient nie może
+    zapisać w `users/{uid}`". The agent read the block, did not find the answer,
+    searched the repository instead and answered `allow write: if false;`.
+
+    So the excerpt is the head, then for every heading below it the heading's own
+    title and the first line under it. A heading names its section in a few words,
+    and that is what tells a reader whether the rest is worth fetching. Measured
+    against the same five questions, without a model — a block that does not
+    contain the string a correct answer needs cannot be answered from the block,
+    so substring sufficiency is checked directly:
+
+        rule                        cap needed for 5/5   block then
+        head, 7 lines (before)      never                 2541
+        head 2100 chars, flat       7000                  6115
+        head 200 + section leads    2800                  2794
+
+    The structural rule reaches the answer at less than half the price of a flat
+    raise, and at a *lower* median block than the rule it replaces — 2311 characters
+    against 2356, measured over the five questions of `savings_test.py` — while
+    answering 5/5 instead of 4/5, with junk prompts still at 0/14. That is why it
+    is not a budget increase: on the ~27% of prompts where the notes answer nothing,
+    a bigger flat budget is pure cost, and this one is not.
+
+    What this does **not** establish is that a model will use what it is given. The
+    run immediately after this change had `affectedKeys` in the block and still came
+    back with "nie znalazłem" — the substring check says the block *can* support an
+    answer and nothing more. See the README.
+
+    Lines are indented so a Markdown bullet inside a note can never be mistaken
+    for a note header by `injected_ids()`. Headings keep their words and lose
+    their `#`. `limit` counts the note's own characters — the indent and the
+    section marker are the block's, and `MAX_BLOCK_CHARS` is what bounds it.
 
     Returns "" when the file is unreadable, which makes the caller fall back to the
     snippet — a hook must degrade, never fail.
@@ -557,24 +606,58 @@ def note_excerpt(path: str | None, limit: int = BODY_CHARS) -> str:
     except OSError:
         return ""
 
+    head_budget = min(HEAD_CHARS, limit)
     out: list[str] = []
     used = 0
+    head_open = True       # still spending the head budget
+    lead_next = False      # the next prose line is a section's lead
     truncated = False
+
     for raw in FRONTMATTER_RE.sub("", text, count=1).splitlines():
-        line = raw.strip().lstrip("#").strip()
+        line = raw.strip()
         if not line or TABLE_SEP_RE.match(line):    # `|---|---|` carries no content
             continue
+
+        if head_open and head_budget - used < MIN_TAIL_CHARS:
+            head_open = False                       # the head is full; sections follow
+            truncated = True
+
+        heading = HEADING_RE.match(line)
+        if heading:
+            if head_open:
+                line = line.lstrip("#").strip()     # in the head a heading is prose
+            else:
+                title = tidy(heading.group(1), HEADING_CHARS)
+                if not title or used + len(SECTION_MARK) + len(title) >= limit:
+                    truncated = True
+                    break
+                out.append(SECTION_MARK + title)
+                used += len(title) + len(SECTION_MARK)
+                lead_next = True
+                continue
+
+        if head_open:
+            room = head_budget - used
+            if len(line) > room:
+                out.append("  " + _cut(line, room))
+                used += room
+                head_open = False
+            else:
+                out.append("  " + line)
+                used += len(line)
+            continue
+
+        if not lead_next:
+            continue                                # prose between sections
         room = limit - used
-        if room < MIN_TAIL_CHARS or len(out) >= BODY_LINES:
+        if room < MIN_TAIL_CHARS:
             truncated = True
             break
-        if len(line) > room:
-            head = line[:room]
-            ends = [m.end() for m in SENTENCE_END_RE.finditer(head)]
-            line = (head[:ends[-1]] if ends else head.rstrip()) + " \u2026"
-            truncated = False                      # this line already says so
-        out.append("  " + line)
-        used += len(line)
+        lead = _cut(line, min(LEAD_CHARS, room)) if len(line) > min(LEAD_CHARS, room) else line
+        out.append("    " + lead)
+        used += len(lead)
+        lead_next = False
+
     if truncated and out:
         out.append("  \u2026")                      # the note continues; say so
     return "\n".join(out)

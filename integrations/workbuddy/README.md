@@ -18,15 +18,23 @@ without the agent deciding to go looking.
 
 ## What gets injected, and why it is content rather than a pointer
 
-Each hit arrives with **the head of the note itself**, not just its title:
+Each hit arrives with **the note's own content** — its opening prose, then every
+later heading with the line beneath it — not just its title:
 
 ```
-[agtmem] 1 trafienie w pamięci projektu (pełna treść: `agtmem show <id>`):
-- fact/verbigem-release-pipeline-android-to-mini · 2026-09-15 — Wydanie Androida trafia na…
-  Kanał „strona" (APK do pobrania) i kanał „Play" (AAB) są niezależne i łatwo je rozjechać.
-  Pięć miejsc do podbicia
-  1. `android/app/build.gradle.kts` — `versionCode` / `versionName`.
-  2. `mini/vite.config.ts` — `ANDROID_VERSION_CODE` / `ANDROID_VERSION_NAME`. …
+[agtmem] 3 trafienia w pamięci projektu (pełna treść: `agtmem show <id>`):
+- fact/firebase-identity-and-rules-model · 2026-09-15 — Tożsamość i reguły w Verbigem:…
+  Model tożsamości i reguł w Verbigem. Pięć rzeczy, które wracają jako pytania.
+  1. Wszystko żyje w projekcie `mini-verbigem`
+  Nazwa projektu Firebase: **`mini-verbigem`** (nie `verbigem-app-7k2`). …
+  § 2. „Ten sam e-mail ma dwa uid" to nie dziura — to dwa projekty Firebase
+    Firebase Auth jest **per projekt**. …
+  § 3. Po co są dwie kolekcje: `users` i `usersPublic`
+    `users/{uid}` jest **owner-read-only** (`request.auth.uid == uid`) …
+  § Lista pól, których klient nie może zapisać w `users/{uid}`
+    Reguła `update` używa `affectedKeys().hasAny([...])`:
+  § 4. Podkolekcje NIE kaskadują
+    Usunięcie `users/{uid}` **nie** usuwa podkolekcji. Zostają:
 ```
 
 The first version of this hook injected `- fact/<id> — <title>` plus a
@@ -36,18 +44,42 @@ injections was followed by a `show`** — the decision never happened, so every
 note was delivered and never read. That is the original failure this project
 exists to fix, merely moved one step later.
 
-Notes cannot be injected whole (median ~3 kB, mean ~9.8 kB, max 96 kB), but
-their head can, and by the store's own convention the first section is the
-essence. `search --json` returns a `path` but **not the body**, so the hook reads
-the file itself — one local read per injected note, no second search. Excerpts
-are indented, which is what keeps a Markdown bullet inside a note from being
-mistaken for a note header.
+The second version carried the note's **head** — seven lines of prose — on the
+reasoning that by the store's own convention the first section is the essence.
+That failed the same way, one level down, and it failed *silently*: the block
+held the note's id, its title and its first two sections, and none of its answer,
+because `affectedKeys().hasAny([...])` sits at character 2 046 of a 3 289-character
+body, under a heading in section 3. The agent read the block, did not find the
+answer, searched the repository instead and answered `allow write: if false;`.
+A block that carries a note's name but not its answer looks exactly like a
+healthy injection.
 
-| | pointer version | content version |
+So the excerpt is the head, **then every later heading with its lead line**. A
+heading names its section in a few words; that is what tells a reader whether the
+rest is worth fetching. Measured on the same five questions:
+
+| excerpt rule | cap needed to reach every answer | block then |
 | --- | --- | --- |
-| per note | ~30 tokens | ~180 tokens |
-| whole block | 105–284 tokens | **~250–520 tokens** |
-| one `agtmem search --json` it replaces | 1234 tokens | 1234 tokens |
+| head, 7 lines (before) | never | 2 541 chars |
+| head 2 100 chars, flat | 7 000 | 6 115 chars |
+| **head 200 + section leads** | **2 800** | **2 794 chars** |
+
+The structural rule reaches the answer at less than half the price of a flat
+raise, and at a *lower* median block than the rule it replaces — 2 311 characters
+against 2 356 — while answering **5/5 instead of 4/5**, with junk prompts still
+at 0/14. That is why it is not a budget increase: on the ~27 % of prompts where
+the notes answer nothing, a bigger flat budget is pure cost, and this one is not.
+
+Notes cannot be injected whole (median ~2.5 kB, max 96 kB). `search --json`
+returns a `path` but **not the body**, so the hook reads the file itself — one
+local read per injected note, no second search. Excerpts are indented, which is
+what keeps a Markdown bullet inside a note from being mistaken for a note header.
+
+| | pointer version | head only | **head + section leads** |
+| --- | --- | --- | --- |
+| per note | ~30 tokens | ~180 tokens | ~330 tokens |
+| whole block | 105–284 tokens | ~250–520 tokens | **~640 tokens** |
+| one `agtmem search --json` it replaces | 1234 tokens | 1234 tokens | 1234 tokens |
 
 The cost is real and the trade is deliberate: a day of 33 prompts costs roughly
 20 k tokens of injected context, against 474 k tokens spent that same day on
@@ -388,58 +420,67 @@ file* to read. What it pays instead is a search.
 
 | | |
 | --- | --- |
-| block size | median **748–772 tokens** (2 356–2 383 characters) |
-| hook latency | **0.35 s**, including one store search |
+| block size | median **797 tokens** (2 311 characters) |
+| hook latency | **0.35–0.42 s**, including one store search |
 | paid on | every prompt where the hook injects |
+
+The character count fell when the excerpt rule changed (2 356 → 2 311) while the token
+count rose slightly (748 → 797). The obvious suspect was the new `§` marker, so the
+provider's own tokenizer was asked: a 2 876-character block and the same block with an
+ASCII marker both report **938 prompt tokens**. The marker is free. The extra tokens are
+the section lines themselves, which are short and fragmented — and they are what makes
+the answer reachable.
 
 ### The return, and the three classes it comes in
 
-Fifteen runs (3 repetitions × 5 questions, `openai/gpt-4o-mini`) split into three
-classes, and only the first is a saving. Averaging them together is how a cost
-measurement starts lying.
+Only the first class is a saving, and averaging the three together is how a cost
+measurement starts lying:
+
+| class | what it means |
+| --- | --- |
+| both arms answered | the only like-for-like measurement |
+| only A answered | the store is the **only** place the fact exists |
+| A also missed | the block was off-topic: cost with no return |
 
 The repetitions are kept separate rather than averaged because **arm B gave different
-verdicts on the same question**: it found the answer on question 2 in the first run and
-failed on it in the second, at temperature 0. The tool loop is path-dependent — a
-different first `grep` leads somewhere else. A single run of this harness would have
-produced a confident number in either direction.
+verdicts on the same question**: it found the answer on question 2 in one run and failed
+on it in the next, at temperature 0. The tool loop is path-dependent — a different first
+`grep` leads somewhere else. A single run would produce a confident number in either
+direction, which is why the third class is diagnosed rather than averaged away.
 
-| class | n | what it means |
-| --- | --- | --- |
-| both arms answered | 1 / 15 | the only like-for-like measurement |
-| only A answered | 10 / 15 | the store is the **only** place the fact exists |
-| A also missed | 4 / 15 | the block was off-topic: cost with no return |
-
-**The one clean pair** — the same question answered correctly by both arms:
+**The current run, under the current excerpt rule (5 questions, `openai/gpt-4o-mini`):
+0 / 5 / 0.** Arm A answered every question; arm B answered none.
 
 | | arm A | arm B |
 | --- | --- | --- |
-| tokens | 880 | 6 346 |
-| tool calls | **0** | **9** |
-| wall time | 1.1 s | 11.7 s |
-| saved | **5 466 tokens, 9 tool calls, 10.6 s** | |
+| answered correctly | **5 / 5** | **0 / 5** |
+| tokens, median | **1 106** | 2 184 |
+| tool calls, median | **0** | 6 |
+| wall time, median | **1.7 s** | 10.4 s |
+| token difference, median | **+1 196** | |
 
-One data point is not a mean, and it is reported as one data point.
+The token saving is real but not uniform, and the table should not pretend otherwise:
+on questions 3 and 4 arm B spent **fewer** tokens than arm A (773 vs 1 106, 709 vs 1 165)
+because it gave up quickly. A cheap failure is not a saving. What *is* uniform is the
+shape: arm A answered four of five with **zero tool calls**, and the one that needed a
+call needed exactly one, while arm B spent 1–9 calls and never got there. The robust
+numbers are the **tool calls** (median 0 vs 6) and the **wall time** (median 1.7 s vs
+10.4 s) — and, above all, the answer.
 
-**Across fifteen runs, arm B answered correctly once.** It spent 707–7 174 tokens and
-2–11 tool calls per attempt and usually came back saying it could not find the fact —
-including on questions whose answer is sitting in the repository. The cost of a failed
-search is the same as the cost of a successful one, which is the part a "savings"
-table usually hides.
-
-**When the block is on target, arm A answers with zero tool calls** in most of its
-correct runs: ~900–1 300 tokens and ~1–2 s, against 2–11 tool calls and 3–13 s. The
-exceptions are instructive — two runs needed 5–6 tool calls and 8 877–11 378 tokens
-even though the note was in front of them.
+An earlier fifteen-run measurement under the **old** excerpt rule split **1 / 10 / 4**.
+That class of four was the one worth chasing, and chasing it is what produced the two
+sections below. It is kept here because the bucket is not empty by construction: it is
+empty in this run, on these five questions, with this model.
 
 ### The reading
 
 **The per-prompt answer is a split, not an average.** On a prompt whose answer the
-store has and whose retrieval lands, the block buys back roughly **4 000–6 300 tokens
-and 3–11 tool calls**, for a price of ~750 tokens. On a prompt where retrieval misses,
-the block is a **pure cost**, and worse than a pure cost: arm A spent 4 746 tokens on
-3 tool calls and still answered wrongly, because a plausible-but-adjacent block makes
-the model search *and* mislead itself.
+store has and whose retrieval lands, arm A answers in ~1 000–2 400 tokens and 0–1 tool
+calls, against 1–9 tool calls and 3–13 s for arm B — which usually comes back saying it
+could not find the fact at all. On a prompt where retrieval misses, the block is a
+**pure cost**, and worse than a pure cost: arm A spent 4 746 tokens on 3 tool calls and
+still answered wrongly, because a plausible-but-adjacent block makes the model search
+*and* mislead itself.
 
 So the variable that decides the sign is **retrieval precision**, not the size of the
 block. Tightening the block would not help a miss.
@@ -476,17 +517,63 @@ the edge of a plateau, so the choice is not a knife edge.
 **The deterministic result: retrieval went 4/5 → 5/5**, verified by
 `savings_test.py --why` and by two regression tests.
 
-**The end-to-end result is not measurable at this sample size, and saying otherwise
-would be dishonest.** Across the three cost runs the "arm A also missed" class read
-2, 1, 2. Arm A's verdict on question 1 flips between runs *with the same block*, so the
-difference is inside the model's behaviour, not in what the store sent. A deterministic
-retrieval improvement is visible; its effect on a five-question outcome is not.
+### What the third class led to, part two: the block had the note but not its answer
 
-**And the fix moved the problem rather than ending it.** For question 3 the answering
-note is now in the block — at position **3**, behind two adjacent notes — and the model
-still answered with `allow write: if false;` instead of `affectedKeys().hasAny([...])`.
-The note is present and the model follows the leader. That is a *position* problem
-inside the block, and it is the next thing to look at.
+Fixing the cap put question 3's answering note back in the block, and the block still
+did not answer the question. That is the more interesting failure, because it looks
+exactly like a healthy injection: the note's id and title were there.
+
+The diagnosis, measured without a model:
+
+| question | answering note | where it ranks | how deep the answer is |
+| --- | --- | --- | --- |
+| 1 | `verbigem-release-pipeline-android-to-mini` | 1 / 6 | 645 chars |
+| 2 | `play-flavors-play-vs-standalone` | 1 / 6 | 683 chars |
+| 3 | `firebase-identity-and-rules-model` | **3 / 6** | **2 046 chars** |
+| 4 | `bug-noadsuntil-400-days` | 1 / 6 | 314 chars |
+| 5 | `bug-aab-language-split-hides-locales` | 1 / 6 | 277 chars |
+
+Four of five needed under 700 characters, which the old `BODY_CHARS = 700` delivered —
+hence 4/5. The fifth needed 2 046, inside a note that ranked **third**, so no budget for
+the *top* note could reach it. `firebase-identity-and-rules-model` is five numbered
+sections and `BODY_LINES = 7` bought sections 1 and 2; the answer is a sentence under a
+heading in section 3. Arm A read that block, did not find the answer, searched the
+repository instead and answered `allow write: if false;`.
+
+| excerpt rule | cap needed to reach every answer | block then |
+| --- | --- | --- |
+| head, 7 lines | never | 2 541 chars |
+| head 2 100 chars, flat | 7 000 | 6 115 chars |
+| **head 200 + one lead line per later heading** | **2 800** | **2 794 chars** |
+
+So the excerpt is now the head, then every later heading with the line beneath it — a
+heading names its section in a few words, which is what tells a reader whether the rest
+is worth fetching. It reaches the answer at less than half the price of a flat raise, at
+a **lower median block than the rule it replaces** (2 311 vs 2 356 characters), with
+junk prompts still at **0/14** and substring sufficiency at **5/5**.
+
+**The trap in that last sentence is worth stating plainly: "the block contains the
+string" is necessary, not sufficient.** The run immediately after the change had
+`affectedKeys` in the block for question 3 — and arm A still replied *"nie znalazłem
+pliku ... ani wywołania"*, refusing both halves because it could not supply one. The
+block was fine. The **question** was not: it asked two things, and the second half (the
+file name) lives in a note marked `status: superseded`, which is deliberately never
+injected. A question whose answer the block cannot contain is not a test of the block,
+so the question was split and kept as its answerable half. After that: **5/5 answered by
+arm A, 0/5 by arm B.**
+
+Two lessons, both about instrumentation rather than retrieval. A substring check tells
+you what the block *can* support and nothing about whether a model will use it. And a
+question that fails can be failing for a reason that is in the question — which is why
+the failing case is diagnosed with the ranking in hand instead of being counted.
+
+### And the end-to-end effect is still not measurable at this sample size
+
+Across the cost runs the "arm A also missed" class read 2, 1, 2, then **0**. Arm A's
+verdict on a question flips between runs *with the same block*, so the difference is
+inside the model's behaviour, not in what the store sent. A deterministic retrieval
+improvement is visible; its effect on a five-question outcome is not, and one clean run
+is not evidence that the bucket is closed.
 
 **Re-ranking was tried and rejected, with evidence.** Weighting each matched term by its
 rarity in the store (idf) pushes question 3 from rank 10 to **rank 15**, because the
@@ -494,9 +581,9 @@ notes that win also match the question's rare words. The term that identifies th
 is absent from the question, and no reweighting of query terms can invent it. The
 measurement is recorded in the eval set's header so it is not retried blind.
 
-Two limits worth stating. Arm B's 1/15 is partly a weak-model result — a stronger model
-searches better, and the *transferable* number is the cost per attempt (2–11 tool calls,
-0.7–7.2 k tokens), not the success rate. And the tool output caps
+Two limits worth stating. Arm B's 0/5 is partly a weak-model result — a stronger model
+searches better, and the *transferable* number is the cost per attempt (1–9 tool calls,
+0.7–5.6 k tokens), not the success rate. And the tool output caps
 (`GREP_MAX_MATCHES = 40`, `READ_MAX_LINES = 120`, a 25 s grep budget) decide how
 expensive arm B is, so they are constants in the file rather than incidental
 settings: an uncapped grep would make the store look magnificent.
@@ -507,7 +594,7 @@ settings: an uncapped grep would make the store look magnificent.
 python test_agtmem_inject.py
 ```
 
-207 checks, no dependencies beyond the standard library and an `agtmem` that can
+217 checks, no dependencies beyond the standard library and an `agtmem` that can
 be imported. The suite is hermetic: it points `AGTMEM_HOOK_RUNTIME` at a
 temporary directory *before* importing the hook, so it never touches the live log
 or state. Getting that wrong once meant a verification call silenced a note for a

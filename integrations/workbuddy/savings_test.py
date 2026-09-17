@@ -118,9 +118,22 @@ QUESTIONS = [
         want="play-flavors-play-vs-standalone",
     ),
     dict(
-        q="Który plik w mini definiuje reguły dostępu do Firestore i jak nazywa się "
-          "wywołanie chroniące pola przed zapisem z klienta?",
-        truth=["firestore.rules", "affectedKeys"],
+        q="Jak nazywa się wywołanie w regułach Firestore w mini, które chroni "
+          "pola przed zapisem z klienta?",
+        # One half of the question, on purpose. The original asked two things —
+        # which file defines the rules, and the name of the call — and the two
+        # halves live in *different* notes: `firebase-identity-and-rules-model`
+        # holds `affectedKeys` and never names the file, while the file name is in
+        # `firestore-rules-client-write-blocklist`, which is `status: superseded`
+        # and therefore deliberately not injected. Requiring both made the case
+        # unanswerable by construction, and the first cost run showed exactly how
+        # that reads: arm A made two tool calls and replied "nie znalazłem pliku
+        # ... ani wywołania" — refusing both halves because it could not supply
+        # one, while the block in front of it contained `affectedKeys`.
+        #
+        # A question whose answer the block cannot contain is not a test of the
+        # block. Verified by grepping the corpus for each string separately.
+        truth=["affectedKeys"],
         kind="obecny stan repo",
         want="firebase-identity-and-rules-model",
     ),
