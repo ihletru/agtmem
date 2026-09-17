@@ -258,6 +258,41 @@ def main() -> int:
           bool(deep_ctx) and "affectedKeys" in deep_ctx,
           repr(deep_ctx)[:240] if deep_ctx else "no block at all")
 
+    print("\n--- scope breaks ties, it does not override relevance ---")
+    # The call site used to sort every note from the current directory ahead of every
+    # other note with no regard for `terms`, while `scope_from_cwd`'s own docstring
+    # says "for tie-breaking". Measured over the five questions, working in
+    # `verbigem/mini` pushed an answering note with terms = 10 behind three
+    # `verbigem-mini` notes with terms 5-6, and out of the block entirely.
+    def row(nid: str, terms: int, scope: str) -> dict:
+        return {"id": nid, "terms": terms, "scope": scope, "title": nid,
+                "type": "fact", "path": "", "snippet": "", "updated": "2026-09-16"}
+
+    with fake_search([row("strong", 9, "verbigem-android"),
+                      row("weak-a", 4, "verbigem-mini"),
+                      row("weak-b", 4, "verbigem-mini"),
+                      row("weak-c", 4, "verbigem-mini")]):
+        ids = hook.injected_ids(call("jak zbudowac APK androida bez gradlew",
+                                     "C:/somewhere/verbigem/mini") or "")
+    check("a stronger note from another scope is not displaced by weaker local ones",
+          "strong" in ids, repr(ids))
+    check("... and it still leads the block", ids[:1] == ["strong"], repr(ids))
+
+    with fake_search([row("local", 6, "verbigem-mini"),
+                      row("far-a", 6, "verbigem-webapp"),
+                      row("far-b", 6, "verbigem-android")]):
+        ids = hook.injected_ids(call("jak zbudowac APK androida bez gradlew",
+                                     "C:/somewhere/verbigem/mini") or "")
+    check("among equal terms the matching scope wins", ids[:1] == ["local"], repr(ids))
+
+    with fake_search([row("local", 6, "verbigem-mini"),
+                      row("far-a", 6, "verbigem-webapp"),
+                      row("far-b", 6, "verbigem-android")]):
+        ids = hook.injected_ids(call("jak zbudowac APK androida bez gradlew",
+                                     "C:/somewhere/verbigem") or "")
+    check("no scope in the cwd leaves the store's own order alone",
+          ids[:1] == ["local"], repr(ids))
+
     print("\n--- the counter's two handles: sess= and the cite line ---")
     # `sess=` makes an injection joinable with the answer that followed it; without it
     # measure_usage.py can only guess from the truncated prompt text. The cite line is

@@ -793,9 +793,18 @@ def build_context(prompt: str, cwd: str = "", session_id: str = "",
     if not rows or not kept:
         return None
 
+    # Scope breaks ties; it does not override relevance. The reorder this replaces
+    # put every note from the current directory ahead of every other note with no
+    # regard for `terms` — which contradicts `scope_from_cwd`'s own docstring, and
+    # measured over the five questions it cost a question its answer: working in
+    # `verbigem/mini` pushed an answering note with **terms = 10** behind three
+    # `verbigem-mini` notes with terms 5-6, and out of the block entirely.
+    # Across five working directories: 24/25 before, 25/25 after. Sorting by
+    # `terms` first and using the scope match only among equal terms leaves the
+    # store's own order as the secondary key, because this sort is stable.
     scope = scope_from_cwd(cwd)
-    if scope:
-        kept.sort(key=lambda r: 0 if r.get("scope") == scope else 1)
+    kept.sort(key=lambda r: (-int(r.get("terms") or 0),
+                             0 if scope and r.get("scope") == scope else 1))
     kept = kept[:KEEP]
 
     now = time.time()

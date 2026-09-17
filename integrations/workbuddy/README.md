@@ -567,6 +567,36 @@ you what the block *can* support and nothing about whether a model will use it. 
 question that fails can be failing for a reason that is in the question — which is why
 the failing case is diagnosed with the ranking in hand instead of being counted.
 
+### And a reorder that contradicted its own docstring
+
+Having made the block reach deeper, the next question was the **margin**: the answering
+note for question 3 sits at position **3 of 6**, with `KEEP = 3` — the last one in, and
+three other notes tied on the same `terms` value. So coverage rested on one position.
+Checking where that position came from turned up a plain bug.
+
+`build_context` reordered the gated rows so that notes whose `scope` matches the current
+directory came first — **regardless of `terms`**. `scope_from_cwd`'s own docstring says
+*"for tie-breaking"*. The call site did something much stronger, and it cost a question
+its answer: working in `verbigem/mini` (scope `verbigem-mini`), question 4's answering
+note has **terms = 10**, far ahead of everything else in the list — and was pushed to
+position 4 behind three `verbigem-mini` notes with terms 5–6, out of the block entirely.
+
+| variant | `(none)` | `verbigem` | `verbigem/mini` | `…/android` | `…/webapp` | total |
+| --- | --- | --- | --- | --- | --- | --- |
+| scope first, `terms` ignored | 5/5 | 5/5 | **4/5** | 5/5 | 5/5 | 24/25 |
+| `terms` desc, scope as the tie-break | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | **25/25** |
+| no scope reorder at all | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 | 25/25 |
+
+Sorting by `terms` descending and using the scope match only among equal terms leaves the
+store's own order as the secondary key — Python's sort is stable — and reaches 25/25. The
+scope signal is kept rather than dropped, because the last two rows tie and dropping a
+signal needs a reason as good as keeping it. Four regression tests pin the behaviour,
+including the case where the cwd has no scope at all.
+
+The margin itself is worth stating: for question 3 the answer is **the last note in**. That
+is one ranking position from falling out, which is why the substring test for that question
+is a real guard rather than a formality.
+
 ### And the end-to-end effect is still not measurable at this sample size
 
 Across the cost runs the "arm A also missed" class read 2, 1, 2, then **0**. Arm A's
@@ -594,7 +624,7 @@ settings: an uncapped grep would make the store look magnificent.
 python test_agtmem_inject.py
 ```
 
-217 checks, no dependencies beyond the standard library and an `agtmem` that can
+221 checks, no dependencies beyond the standard library and an `agtmem` that can
 be imported. The suite is hermetic: it points `AGTMEM_HOOK_RUNTIME` at a
 temporary directory *before* importing the hook, so it never touches the live log
 or state. Getting that wrong once meant a verification call silenced a note for a
