@@ -851,6 +851,40 @@ def main() -> int:
           {t["function"]["name"] for t in savings.TOOLS} == {"grep", "read", "list_dir"},
           str(sorted(t["function"]["name"] for t in savings.TOOLS)))
 
+    print("\n--- the query cap: judged on four sets, because it is a two-sided limit ---")
+
+    # The defect: truncation cut the *tail* of an ordinary question, and in Polish the
+    # specific noun comes last. Losing `klienta` put the answering note at rank 3 on the
+    # raw question and rank 10 on the hook's query, so the note was never injected.
+    # This check is store-independent and names the exact loss.
+    tail = hook.content_words(
+        "Który plik w mini definiuje reguły dostępu do Firestore i jak nazywa się "
+        "wywołanie chroniące pola przed zapisem z klienta?")
+    check("the cap keeps an ordinary question's last content word",
+          "klienta" in hook.query_words(tail)[:hook.MAX_QUERY_WORDS],
+          str(hook.query_words(tail)[:hook.MAX_QUERY_WORDS]))
+    check("MAX_QUERY_WORDS is the measured value, not a round number",
+          hook.MAX_QUERY_WORDS == 16, str(hook.MAX_QUERY_WORDS))
+
+    # The end-to-end half. Both of these need a store with content, like the rest of
+    # this suite: 14 would pass the first and fail the second, which is why both exist.
+    found = hook.build_query(
+        "Który plik w mini definiuje reguły dostępu do Firestore i jak nazywa się "
+        "wywołanie chroniące pola przed zapisem z klienta?")
+    picked = [r["id"] for r in found["kept"][:hook.KEEP]]
+    check("a description-style question reaches its note",
+          "firebase-identity-and-rules-model" in picked,
+          f"picked {picked} need={found['need']}")
+    long_prompt = (
+        "Przejrzyj prosze to co wiemy o reguach dostepu w Firestore i o tym kto moze "
+        "zapisywac jakie pola, bo znowu ktos z klienta probowal nadpisac sobie plan i "
+        "nie jestem pewien czy reguly to lapia, czy tylko funkcja. Interesuje mnie "
+        "zarowno sam plik regul, jak i to czy jest jakas lista pol ktore sa chronione, "
+        "bo pamietam ze bylo z tym zamieszanie i trzeba bylo cos dopisywac recznie.")
+    check("a long prompt is still injected (the failure the cap was built for)",
+          hook.build_context(long_prompt, session_id="cap-test") is not None,
+          f"need would be {hook.required_terms(hook.content_words(long_prompt))}")
+
     print("\n--- latency ---")
     fresh()
     t = time.perf_counter()

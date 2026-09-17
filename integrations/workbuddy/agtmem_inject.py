@@ -94,7 +94,11 @@ KEEP = 3                # notes actually injected
 MIN_TERMS_FLOOR = 3     # absolute floor on matched content words
 TERM_RATIO = 0.3        # ... and a share of the prompt's content words
 MIN_QUERY_CHARS = 4     # query tokens below this are not evidence (see query_words)
-MAX_QUERY_WORDS = 12    # long prompts get truncated, not rejected
+# Long prompts get truncated, not rejected. The value is measured across four sets
+# at once — description-style questions, junk prompts, known misses, long prompts —
+# and 16 is the smallest cap that satisfies all four. See MAX_QUERY_WORDS in the
+# module docstring's sibling note on `query_words`, and `--why` in savings_test.py.
+MAX_QUERY_WORDS = 16
 MAX_BLOCK_CHARS = 2600  # ~650 tokens; the note heads, not just their titles
 TRANSCRIPT_TAIL_BYTES = 200_000  # read the tail; a long transcript is tens of MB
 CONTEXT_TURNS = 6       # how many recent messages count as "the conversation"
@@ -466,6 +470,25 @@ def required_terms(words: list[str]) -> int:
     no note can have, so long prompts were **silently never injected**. With the
     query as the denominator the requirement is 3 or 4, and short prompts behave
     exactly as they did before.
+
+    The cap therefore has a two-sided constraint, and `MAX_QUERY_WORDS` sits at the
+    measured point where both sides are satisfied. Too low and the truncation cuts
+    the *tail* of an ordinary question — in Polish the specific noun often comes
+    last, and losing it cost a whole note: one description-style question put its
+    answering note at rank 3 on the raw question and rank 10 on the hook's query,
+    purely because the cap dropped `klienta` from "…pola przed zapisem z klienta".
+    Too high and `need` rises until long prompts go silent again, which is the
+    failure the cap was introduced to fix. Measured 2026-09-16 over four sets:
+
+        cap   description-style   junk   known misses   long prompts
+        12    4/5                 0/14   0/2            1/2
+        14    5/5                 0/14   0/2            1/2   <- fixes the miss, breaks a long prompt
+        16    5/5                 0/14   0/2            2/2   <- the smallest cap that satisfies all four
+        20+   5/5                 0/14   0/2            2/2   <- flat, so 16 is the edge of a plateau
+
+    A cap of 14 also passes the first three sets, which is why the long-prompt arm
+    has to be measured: without it, 14 looks like the minimal fix and reintroduces
+    the original bug for long prompts.
     """
     return max(MIN_TERMS_FLOOR, math.ceil(TERM_RATIO * len(words[:MAX_QUERY_WORDS])))
 

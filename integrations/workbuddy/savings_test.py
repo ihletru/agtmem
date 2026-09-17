@@ -96,6 +96,11 @@ SKIP_DIRS = {".git", "node_modules", ".next", ".gradle", "build", ".idea",
 # the repository — otherwise arm B could not answer at all and the counterfactual
 # would be meaningless. `truth` lists substrings a correct answer must contain;
 # `kind` records where the answer lives, because that is what decides the price.
+#
+# `want` is the note that ought to answer it. The cost run found the class that
+# matters — a block that is adjacent rather than right — and the next question is
+# always "why was the right note not in it". `--why` answers that with the ranking,
+# so the miss is diagnosed where it was measured instead of in a second harness.
 # --------------------------------------------------------------------------- #
 QUESTIONS = [
     dict(
@@ -103,29 +108,34 @@ QUESTIONS = [
           "auto-update i jakie pola ten plik zawiera?",
         truth=["version.json", "apkUrl"],
         kind="obecny stan repo",
+        want="verbigem-release-pipeline-android-to-mini",
     ),
     dict(
         q="Jakie dwa flavor ma projekt Android i jaki applicationId ma wersja "
           "do instalacji poza sklepem?",
         truth=["com.verbigem.app.sideload"],
         kind="obecny stan repo",
+        want="play-flavors-play-vs-standalone",
     ),
     dict(
         q="Który plik w mini definiuje reguły dostępu do Firestore i jak nazywa się "
           "wywołanie chroniące pola przed zapisem z klienta?",
         truth=["firestore.rules", "affectedKeys"],
         kind="obecny stan repo",
+        want="firebase-identity-and-rules-model",
     ),
     dict(
         q="Dlaczego konto z aktywną subskrypcją Paddle mogło nie widzieć reklam? "
           "Co ustawiała gałąź subscription w paddleWebhook?",
         truth=["400"],
         kind="historia — zakopane w logu pamięci",
+        want="bug-noadsuntil-400-days",
     ),
     dict(
         q="Dlaczego build z Play pokazywał 4 z 6 języków interfejsu?",
         truth=["split"],
         kind="historia — zakopane w logu pamięci",
+        want="bug-aab-language-split-hides-locales",
     ),
 ]
 
@@ -406,6 +416,48 @@ def block_for(question: str) -> str | None:
     return hook.build_context(question, session_id="savings")
 
 
+def why(questions: list) -> int:
+    """Where does the note that should answer this land? No model calls.
+
+    The cost run's third class is the expensive one — a block that is adjacent
+    rather than right costs tokens and buys nothing. A miss there has two very
+    different causes needing different fixes: the note was never in the result list
+    (recall), or it was there and ranked below the injected slots (ranking). This
+    prints which, with the terms behind it.
+    """
+    misses = 0
+    for i, item in enumerate(questions, 1):
+        found = hook.build_query(item["q"])
+        rows = found["rows"]
+        print(f"### {i}. {item['q']}")
+        print(f"    chcemy: {item['want']}")
+        print(f"    zapytanie={found['query']!r}")
+        print(f"    terms={len(found['terms'])} ctx={found['added']} "
+              f"need={found['need']} rows={len(rows)} KEEP={hook.KEEP}")
+        passed, rank = [], None
+        for j, r in enumerate(rows, 1):
+            rid = r.get("id") if isinstance(r, dict) else None
+            rterms = int(r.get("terms") or 0) if isinstance(r, dict) else 0
+            ok = rterms >= found["need"]
+            if ok:
+                passed.append(rid)
+            if rid == item["want"]:
+                rank = j
+            print(f"      {j:2d}. {'PASS' if ok else 'gate'} terms={rterms:3d}  {rid}")
+        if rank is None:
+            misses += 1
+            print("    -> NIE ZNALEZIONA: notatki nie ma na liście wyników (recall)")
+        elif item["want"] not in passed[:hook.KEEP]:
+            misses += 1
+            print(f"    -> POZA MIEJSCAMI: bramka dała pozycję "
+                  f"{passed.index(item['want']) + 1}, a miejsc jest {hook.KEEP} (ranking)")
+        else:
+            print("    -> WSTRZYKNIĘTA")
+        print()
+    print(f"trafione: {len(questions) - misses} / {len(questions)}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=DEFAULT_MODEL)
@@ -414,7 +466,19 @@ def main() -> int:
     ap.add_argument("--max-turns", type=int, default=8)
     ap.add_argument("--timeout", type=float, default=300.0)
     ap.add_argument("--json", action="store_true", help="machine-readable summary")
+    ap.add_argument("--why", action="store_true",
+                    help="no model calls: show where the note that should answer "
+                         "each question lands in the ranking")
     args = ap.parse_args()
+
+    picked = [(i, q) for i, q in enumerate(QUESTIONS, 1)
+              if not args.only or str(i) == args.only]
+    if not picked:
+        print(f"no question matches --only {args.only}", file=sys.stderr)
+        return 2
+
+    if args.why:
+        return why([q for _, q in picked])
 
     if not os.environ.get("OPENROUTER_API_KEY"):
         print("OPENROUTER_API_KEY is not set — no model, no measurement",
@@ -423,12 +487,6 @@ def main() -> int:
     root = os.path.abspath(os.path.expanduser(args.workspace))
     if not os.path.isdir(root):
         print(f"no workspace at {root}", file=sys.stderr)
-        return 2
-
-    picked = [(i, q) for i, q in enumerate(QUESTIONS, 1)
-              if not args.only or str(i) == args.only]
-    if not picked:
-        print(f"no question matches --only {args.only}", file=sys.stderr)
         return 2
 
     print(f"model      : {args.model}")

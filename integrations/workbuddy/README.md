@@ -388,27 +388,27 @@ file* to read. What it pays instead is a search.
 
 | | |
 | --- | --- |
-| block size | median **772 tokens** (2 383 characters) |
+| block size | median **748–772 tokens** (2 356–2 383 characters) |
 | hook latency | **0.35 s**, including one store search |
 | paid on | every prompt where the hook injects |
 
 ### The return, and the three classes it comes in
 
-Ten runs (2 repetitions × 5 questions, `openai/gpt-4o-mini`) split into three classes,
-and only the first is a saving. Averaging them together is how a cost measurement
-starts lying.
+Fifteen runs (3 repetitions × 5 questions, `openai/gpt-4o-mini`) split into three
+classes, and only the first is a saving. Averaging them together is how a cost
+measurement starts lying.
 
-The two repetitions are kept separate rather than averaged because **arm B gave
-different verdicts on the same question**: it found the answer on question 2 in the
-first run and failed on it in the second, at temperature 0. The tool loop is
-path-dependent — a different first `grep` leads somewhere else. A single run of this
-harness would have produced a confident number in either direction.
+The repetitions are kept separate rather than averaged because **arm B gave different
+verdicts on the same question**: it found the answer on question 2 in the first run and
+failed on it in the second, at temperature 0. The tool loop is path-dependent — a
+different first `grep` leads somewhere else. A single run of this harness would have
+produced a confident number in either direction.
 
 | class | n | what it means |
 | --- | --- | --- |
-| both arms answered | 1 / 10 | the only like-for-like measurement |
-| only A answered | 7 / 10 | the store is the **only** place the fact exists |
-| A also missed | 2 / 10 | the block was off-topic: cost with no return |
+| both arms answered | 1 / 15 | the only like-for-like measurement |
+| only A answered | 10 / 15 | the store is the **only** place the fact exists |
+| A also missed | 4 / 15 | the block was off-topic: cost with no return |
 
 **The one clean pair** — the same question answered correctly by both arms:
 
@@ -421,22 +421,22 @@ harness would have produced a confident number in either direction.
 
 One data point is not a mean, and it is reported as one data point.
 
-**Across all ten runs, arm B answered correctly once.** It spent 743–5 509 tokens and
-2–9 tool calls per attempt and usually came back saying it could not find the fact —
+**Across fifteen runs, arm B answered correctly once.** It spent 707–7 174 tokens and
+2–11 tool calls per attempt and usually came back saying it could not find the fact —
 including on questions whose answer is sitting in the repository. The cost of a failed
 search is the same as the cost of a successful one, which is the part a "savings"
 table usually hides.
 
-**When the block is on target, arm A answers with zero tool calls** in 6 of its 7
-correct runs: ~1 000 tokens and ~2 s, against 2–9 tool calls and 4–15 s. The
-exception is instructive — one run needed 6 tool calls and 11 378 tokens even though
-the note was in front of it.
+**When the block is on target, arm A answers with zero tool calls** in most of its
+correct runs: ~900–1 300 tokens and ~1–2 s, against 2–11 tool calls and 3–13 s. The
+exceptions are instructive — two runs needed 5–6 tool calls and 8 877–11 378 tokens
+even though the note was in front of them.
 
 ### The reading
 
 **The per-prompt answer is a split, not an average.** On a prompt whose answer the
-store has and whose retrieval lands, the block buys back roughly **4 000–5 500 tokens
-and 8–10 tool calls**, for a price of ~772 tokens. On a prompt where retrieval misses,
+store has and whose retrieval lands, the block buys back roughly **4 000–6 300 tokens
+and 3–11 tool calls**, for a price of ~750 tokens. On a prompt where retrieval misses,
 the block is a **pure cost**, and worse than a pure cost: arm A spent 4 746 tokens on
 3 tool calls and still answered wrongly, because a plausible-but-adjacent block makes
 the model search *and* mislead itself.
@@ -444,9 +444,59 @@ the model search *and* mislead itself.
 So the variable that decides the sign is **retrieval precision**, not the size of the
 block. Tightening the block would not help a miss.
 
-Two limits worth stating. Arm B's 1/10 is partly a weak-model result — a stronger
-model searches better, and the *transferable* number is the cost per attempt (2–9
-tool calls, 0.7–5.5 k tokens), not the success rate. And the tool output caps
+### What the third class led to: the query cap was cutting the question's tail
+
+The class that costs without paying is the one worth chasing, so it was diagnosed
+rather than averaged. For question 3 the answering note was **not in the result list
+at all** — a recall failure, not a ranking one — and the cause was not in the store:
+
+| query | rank of the answering note |
+| --- | --- |
+| the raw question | **3** (terms = 7) |
+| the hook's processed query | **10** (terms = 5) |
+
+`MAX_QUERY_WORDS` truncated the question and dropped its **last** content word,
+`klienta` — and in Polish the specific noun tends to come last. The cap exists for a
+measured reason (a 367-word prompt once demanded 111 matched terms and was therefore
+never injected), so it is a two-sided limit: too low cuts ordinary questions, too high
+puts `need` back out of reach for long prompts. It was judged on four sets at once:
+
+| cap | description-style | junk | known misses | long prompts |
+| --- | --- | --- | --- | --- |
+| 12 | 4/5 | 0/14 | 0/2 | 1/2 |
+| 14 | 5/5 | 0/14 | 0/2 | **1/2** |
+| **16** | **5/5** | **0/14** | **0/2** | **2/2** |
+| 20–32 | 5/5 | 0/14 | 0/2 | 2/2 |
+
+14 also passes the first three sets, which is exactly why the long-prompt arm has to be
+measured: without it, 14 looks like the minimal fix and silently reintroduces the bug
+the cap was written for. 16 is the smallest cap that satisfies all four, and it sits at
+the edge of a plateau, so the choice is not a knife edge.
+
+**The deterministic result: retrieval went 4/5 → 5/5**, verified by
+`savings_test.py --why` and by two regression tests.
+
+**The end-to-end result is not measurable at this sample size, and saying otherwise
+would be dishonest.** Across the three cost runs the "arm A also missed" class read
+2, 1, 2. Arm A's verdict on question 1 flips between runs *with the same block*, so the
+difference is inside the model's behaviour, not in what the store sent. A deterministic
+retrieval improvement is visible; its effect on a five-question outcome is not.
+
+**And the fix moved the problem rather than ending it.** For question 3 the answering
+note is now in the block — at position **3**, behind two adjacent notes — and the model
+still answered with `allow write: if false;` instead of `affectedKeys().hasAny([...])`.
+The note is present and the model follows the leader. That is a *position* problem
+inside the block, and it is the next thing to look at.
+
+**Re-ranking was tried and rejected, with evidence.** Weighting each matched term by its
+rarity in the store (idf) pushes question 3 from rank 10 to **rank 15**, because the
+notes that win also match the question's rare words. The term that identifies the answer
+is absent from the question, and no reweighting of query terms can invent it. The
+measurement is recorded in the eval set's header so it is not retried blind.
+
+Two limits worth stating. Arm B's 1/15 is partly a weak-model result — a stronger model
+searches better, and the *transferable* number is the cost per attempt (2–11 tool calls,
+0.7–7.2 k tokens), not the success rate. And the tool output caps
 (`GREP_MAX_MATCHES = 40`, `READ_MAX_LINES = 120`, a 25 s grep budget) decide how
 expensive arm B is, so they are constants in the file rather than incidental
 settings: an uncapped grep would make the store look magnificent.
@@ -457,7 +507,7 @@ settings: an uncapped grep would make the store look magnificent.
 python test_agtmem_inject.py
 ```
 
-203 checks, no dependencies beyond the standard library and an `agtmem` that can
+207 checks, no dependencies beyond the standard library and an `agtmem` that can
 be imported. The suite is hermetic: it points `AGTMEM_HOOK_RUNTIME` at a
 temporary directory *before* importing the hook, so it never touches the live log
 or state. Getting that wrong once meant a verification call silenced a note for a
