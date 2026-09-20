@@ -159,6 +159,71 @@ def reindex(verbose: bool = False) -> dict:
         conn.close()
 
 
+def refresh(verbose: bool = False) -> dict:
+    """Bring the index up to date without rebuilding it.
+
+    `reindex()` is a full rebuild — delete every row, re-read every note — and on
+    this store that measured 11.5 s for 440 notes. A fine price for a command a
+    human types; an impossible one for a hook, which is exactly why the ingest
+    hook had no cheap way to make the note it had just written searchable.
+
+    A note is re-read when its file's mtime differs from the mtime recorded in
+    the index, and only then. Nothing else is touched, so an interrupted run is
+    not a corrupt index — it is a half-refreshed one, and the next run finishes
+    the job.
+
+    Returns `{"notes", "added", "updated", "dropped"}`; `notes` is the number of
+    note files seen, so it stays comparable with `reindex()`'s return value.
+    """
+    conn = connect()
+    try:
+        ensure_schema(conn)
+        known = {row["path"]: (row["id"], row["mtime"])
+                 for row in conn.execute("SELECT id, path, mtime FROM notes")}
+        seen: set[str] = set()
+        added = updated = 0
+        for path in store.iter_note_files():
+            key = str(path)
+            seen.add(key)
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            old = known.get(key)
+            # The mtime is the whole check on purpose: hashing the note to decide
+            # whether to re-read it would mean reading it, which is the cost this
+            # function exists to avoid.
+            if old is not None and abs(old[1] - mtime) < 1e-6:
+                continue
+            try:
+                note = Note.from_file(path)
+            except Exception:
+                continue
+            upsert(conn, note)
+            if old is None:
+                added += 1
+            else:
+                updated += 1
+            if verbose:
+                print(f"  refreshed {note.type:<10} {note.id}")
+
+        # A note deleted from disk must not outlive itself in the index — the
+        # index is a cache, and a cache that answers with a deleted note is worse
+        # than one that is merely stale.
+        gone = [(pid, path) for path, (pid, _) in known.items()
+                if path and path not in seen]
+        for pid, _ in gone:
+            conn.execute("DELETE FROM notes WHERE id = ?", (pid,))
+            conn.execute("DELETE FROM notes_fts WHERE id = ?", (pid,))
+            conn.execute("DELETE FROM notes_tri WHERE id = ?", (pid,))
+        if gone:
+            conn.commit()
+        return {"notes": len(seen), "added": added,
+                "updated": updated, "dropped": len(gone)}
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------- retrieval
 
 # How many candidates each ranker contributes before re-ranking. Generous on

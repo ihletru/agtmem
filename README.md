@@ -584,7 +584,10 @@ WorkBuddy spawns the CodeBuddy CLI, which has a hook system. This hook runs on
 appends the best hits to the context *before* the model sees the prompt — so a
 question about *why* arrives with the relevant note already attached, instead of
 depending on the agent deciding to go looking. It also emits a one-line reminder
-on `SessionStart`.
+on `SessionStart`, writes a checkpoint note on `PreCompact` so a compaction does
+not drop the files and open questions, and imports the finished transcript on
+`SessionEnd` — so the next session can search it instead of waiting up to two
+hours for the distillation pass.
 
 It is the answer to the failure this project exists to fix: the store was being
 written to automatically and read never. What it is *not* is a relevance oracle —

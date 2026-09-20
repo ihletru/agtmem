@@ -305,20 +305,30 @@ def cmd_ingest(args) -> int:
         since=args.since,
         dry_run=args.dry_run,
         limit=args.limit,
+        new_only=args.new_only,
     )
     verb = "would import" if args.dry_run else "new notes"
     print(
         f"{verb}: {result['created']}, "
         f"already stored (skipped): {result['skipped']}"
     )
+    if args.new_only and not args.dry_run:
+        print(
+            "Incremental scan: transcripts untouched since the previous such run "
+            "were skipped unread."
+        )
     if result.get("hit_limit"):
         print(
             "Stopped at the limit — run again to import the rest "
             "(order is stable, nothing is duplicated)."
         )
     if not args.dry_run and result["created"]:
-        index.reindex()
-        print("Index refreshed.")
+        # `refresh`, not `reindex`: this path is also the hook's, and a full
+        # rebuild measured 11.5 s against 0.16 s for one changed note. The
+        # index is a cache either way, so the cheap one is the correct default.
+        touched = index.refresh()
+        print(f"Index refreshed: {touched['added']} added, "
+              f"{touched['updated']} updated, {touched['dropped']} dropped.")
     return 0
 
 
@@ -583,6 +593,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--since", help="only on or after YYYY-MM-DD")
     p.add_argument("--dry-run", action="store_true", dest="dry_run")
     p.add_argument("--limit", type=int, help="how many NEW notes to create per run")
+    p.add_argument(
+        "--new-only",
+        action="store_true",
+        dest="new_only",
+        help="incremental scan: skip transcripts untouched since the last such run; "
+        "for hooks, not for counting the backlog",
+    )
     p.set_defaults(func=cmd_ingest)
 
     p = sub.add_parser("reindex", help="rebuild the index from the files")

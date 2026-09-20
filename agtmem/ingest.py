@@ -143,16 +143,64 @@ def _ts_to_date(record: dict) -> str:
     return date.today().isoformat()
 
 
-def iter_compactions(projects_root: Path = PROJECTS_ROOT, since: str | None = None):
+def read_watermark() -> float | None:
+    """When the last incremental scan started, or None if there has never been one."""
+    try:
+        data = json.loads(store.INGEST_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        return float(data.get("scanned_at"))
+    except (TypeError, ValueError):
+        return None
+
+
+def write_watermark(stamp: float) -> None:
+    """Record the scan's **start** time, not its end.
+
+    A transcript written while the scan is running must still be picked up next
+    time, and using the end time would silently skip it. Atomic, because the
+    caller may be a hook that the CLI kills at its timeout.
+    """
+    tmp = store.INGEST_STATE.with_name(store.INGEST_STATE.name + ".tmp")
+    try:
+        store.INGEST_STATE.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps({"scanned_at": stamp}), encoding="utf-8")
+        os.replace(tmp, store.INGEST_STATE)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def iter_compactions(projects_root: Path = PROJECTS_ROOT, since: str | None = None,
+                     newer_than: float | None = None):
     """Yield (session, line_no, scope, when, summary, self_reported).
 
     `self_reported` is True when the record's own providerData marks it as a
     compaction summary, as opposed to being recognised only by its tag. Both are
     imported; the flag is kept so provenance can record which was which.
+
+    `newer_than` is a unix timestamp; transcripts last modified at or before it are
+    skipped without being read. Off by default, so every existing caller — including
+    `--dry-run`, which is the honest backlog count — keeps scanning everything.
     """
     if not projects_root.exists():
         return
     for path in sorted(projects_root.glob("*/*.jsonl")):
+        if newer_than is not None:
+            # A compaction summary is appended to the transcript as it is produced,
+            # so a file untouched since the last scan cannot hold a new one. This is
+            # the entire cost model: 131 transcripts / 446 MB / ~10 s per full scan
+            # on this machine, against ~0.1 s when nothing has changed.
+            try:
+                if path.stat().st_mtime <= newer_than:
+                    continue
+            except OSError:
+                continue
         scope = scope_from_dir(path.parent.name)
         session = path.stem
         try:
@@ -192,6 +240,7 @@ def ingest(
     since: str | None = None,
     dry_run: bool = False,
     limit: int | None = None,
+    new_only: bool = False,
 ) -> dict:
     """Import compaction summaries that are not stored yet.
 
@@ -204,12 +253,20 @@ def ingest(
     is that a second run over a partially imported backlog reports both created
     and skipped counts, which is expected, not evidence of duplication.
 
-    Returns {"created", "skipped", "hit_limit"}.
+    `new_only` turns on the incremental scan: transcripts untouched since the last
+    such run are skipped unread, and the watermark advances only when the scan ran
+    to completion. It is **off by default on purpose** — it exists so that a hook
+    can afford to run after every session, and the moment it became the default,
+    `--dry-run` would stop being an honest backlog count.
+
+    Returns {"created", "skipped", "hit_limit", "scanned_since"}.
     """
+    scan_started = datetime.now(timezone.utc).timestamp()
+    watermark = read_watermark() if new_only else None
     created, skipped = 0, 0
     hit_limit = False
     for session, lineno, scope, when, summary, self_reported in iter_compactions(
-        projects_root, since
+        projects_root, since, newer_than=watermark
     ):
         note_id = note_id_for(session, lineno, summary)
         if store.find_by_id(note_id) is not None:
@@ -241,4 +298,9 @@ def ingest(
         if limit and created >= limit:
             hit_limit = True
             break
-    return {"created": created, "skipped": skipped, "hit_limit": hit_limit}
+    # Advance only on a scan that actually finished. Stopping at `limit` leaves
+    # records unread, and moving the watermark past them would lose them for good.
+    if new_only and not dry_run and not hit_limit:
+        write_watermark(scan_started - 2.0)
+    return {"created": created, "skipped": skipped, "hit_limit": hit_limit,
+            "scanned_since": watermark}

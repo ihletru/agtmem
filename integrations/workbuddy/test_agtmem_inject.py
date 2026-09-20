@@ -554,7 +554,8 @@ def main() -> int:
             "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other-tool"}]}]}}
     s1, n1 = inst.apply_hooks(json.loads(json.dumps(base)), "workbuddy", remove=False)
     s2, n2 = inst.apply_hooks(json.loads(json.dumps(s1)), "workbuddy", remove=False)
-    check("install writes both events", n1 == 2, str(n1))
+    check("install writes one group per event",
+          n1 == len(inst.EVENTS), f"{n1} vs {len(inst.EVENTS)}")
     check("foreign top-level keys preserved", s1.get("enabledPlugins") == {"x": True})
     check("foreign hooks preserved", len(s1["hooks"].get("Stop") or []) == 1)
     check("re-install is idempotent",
@@ -565,11 +566,18 @@ def main() -> int:
           '"' in groups[0]["hooks"][0]["command"], groups[0]["hooks"][0]["command"])
     check("command carries the label",
           groups[0]["hooks"][0]["command"].endswith("--src=workbuddy"))
+    # Asserted against the table, not a literal: the number of events is a
+    # decision that changes, and a hard-coded 2 is how this check failed the
+    # moment `SessionEnd` was added — reporting a real change as a regression.
+    check("every event carries a timeout",
+          all(g["hooks"][0].get("timeout")
+              for ev in inst.EVENTS for g in s1["hooks"].get(ev) or []),
+          repr({ev: [g["hooks"][0].get("timeout") for g in s1["hooks"].get(ev) or []]
+                for ev in inst.EVENTS}))
 
     s3, _ = inst.apply_hooks(json.loads(json.dumps(s1)), None, remove=True)
     check("uninstall removes only ours",
-          "UserPromptSubmit" not in (s3.get("hooks") or {})
-          and "SessionStart" not in (s3.get("hooks") or {})
+          not any(ev in (s3.get("hooks") or {}) for ev in inst.EVENTS)
           and "Stop" in (s3.get("hooks") or {}),
           repr(sorted((s3.get("hooks") or {}))))
 

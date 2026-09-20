@@ -15,10 +15,10 @@ the script — both of which the installer knows from `sys.executable` and
 
 What it touches
 ---------------
-* `<configDir>/settings.json` — a `hooks` block with `UserPromptSubmit` and
-  `SessionStart`. Existing hooks from other sources are **preserved**; only
-  entries that already point at this script are replaced, so the command is
-  idempotent.
+* `<configDir>/settings.json` — a `hooks` block with `UserPromptSubmit`,
+  `SessionStart`, `PreCompact` and `SessionEnd`. Existing hooks from other
+  sources are **preserved**; only entries that already point at this script are
+  replaced, so the command is idempotent.
 * `agtmem_inject.config.json` next to the hook — the resolved `repo` / `store` /
   `runtime`, written only when they cannot be derived at run time.
 
@@ -46,8 +46,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "agtmem_inject.py")
 SIDECAR = os.path.join(HERE, "agtmem_inject.config.json")
 
-EVENTS = ("UserPromptSubmit", "SessionStart")
+# `PreCompact` is registered here even though it is not an injection: its stdout
+# becomes `preCompactInstructions`, consumed by the compaction step. Same script,
+# same command line — the event name in the payload decides what it does.
+# `SessionEnd` is the fourth, and the only one whose point is a *side effect*:
+# it imports the transcript that just stopped being written, instead of waiting
+# up to two hours for the distillation pass.
+EVENTS = ("UserPromptSubmit", "SessionStart", "PreCompact", "SessionEnd")
 TIMEOUT = 20
+# A per-event budget, because `SessionEnd` runs the incremental ingest inside
+# the hook and that import is allowed to take `INGEST_TIMEOUT` (20 s) on its own.
+# Killing the hook mid-import does not corrupt anything — the notes are written
+# one at a time and the watermark only advances on a clean finish — but it would
+# silently stop the import from ever completing.
+TIMEOUTS = {"SessionEnd": 30, "SessionStart": 30}
 
 
 def log(msg: str) -> None:
@@ -200,7 +212,7 @@ def apply_hooks(settings: dict, label: str | None, remove: bool) -> tuple[dict, 
         if not remove:
             groups.append({"hooks": [{"type": "command",
                                       "command": our_command(label),
-                                      "timeout": TIMEOUT}]})
+                                      "timeout": TIMEOUTS.get(event, TIMEOUT)}]})
             written += 1
         if groups:
             hooks[event] = groups

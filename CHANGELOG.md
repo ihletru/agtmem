@@ -6,6 +6,44 @@ All notable changes to this project. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **A checkpoint on `PreCompact`.** Compaction is the one moment the store can
+  save what the summary is about to drop. The hook reads the transcript *tail*
+  (never the whole file — 18 MB transcripts are normal) for the files written and
+  the asks made, stores them as a `checkpoint-<session>` note, and returns an
+  instruction that becomes `preCompactInstructions`. It is the only hook whose
+  stdout is not injected into the chat: the CLI reads it straight into the
+  compaction step, so it is written **bare**, without the JSON envelope the other
+  events need. `SessionStart` with `source == "compact"` re-injects the same note
+  afterwards, deliberately bypassing the 12 h session suppression — the point of a
+  checkpoint is to survive the boundary it was written for.
+- **A nudge, once per conversation.** Measured: **0 calls** to `mcp__agtmem__*`
+  across 84 transcripts and 11 594 tool calls. Reading was never the bottleneck —
+  the block arrives on roughly two prompts in three. What was missing was a reason
+  to search (a failed gate was silent, which made "nothing to say" indistinguishable
+  from "never consulted") and a reason to write (nothing had ever asked). On a failed
+  gate with at least `MIN_TERMS_FLOOR` content words the nudge is emitted *alone*, so
+  it is the only thing in the block; on a non-empty block it sits **third**, behind
+  the citation line, because placed last it was cut by line-boundary truncation on
+  the first real block it met. It keeps its own state file: the suppression state
+  decides which notes get injected and has been measured, and a nudge counter has no
+  business being able to move those numbers.
+- **`ingest-sessions --new-only`** — an incremental scan. A watermark in
+  `.ingest-state.json` records `scan_started − 2 s`, and transcripts whose mtime is
+  at or below it are skipped unread. A compaction summary is appended to the
+  transcript as it is produced, so a file untouched since the last scan cannot hold
+  a new one; the two-second margin keeps a file written *during* the scan from being
+  missed. The watermark advances only on a clean run — not a dry one, and not one
+  that hit `--limit`. Measured: **0.76 s** to scan one fresh 25 MB transcript against
+  6.7 s for the full 131-transcript scan. This is for hooks; `--dry-run` without it
+  remains the honest backlog count.
+- **`index.refresh()`** — an incremental index update. A note is re-read only when
+  its file's mtime differs from the mtime recorded in the index, and rows for note
+  files that no longer exist are dropped. Measured: **0.16 s** for one changed note
+  against **11.5 s** for a full `reindex()` of 440 notes. `ingest-sessions` now uses
+  it, which is what makes the command affordable inside a hook.
+
 ### Changed
 
 - **Length no longer counts as relevance in re-ranking.** Stage 2 scored a

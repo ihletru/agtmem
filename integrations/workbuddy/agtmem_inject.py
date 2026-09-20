@@ -778,6 +778,88 @@ def build_query(prompt: str, transcript: str = "") -> dict:
             "rows": rows, "kept": kept, "added": added}
 
 
+# --------------------------------------------------------------------------- #
+# The nudge — the only channel that can ask the agent to use the store at all
+# --------------------------------------------------------------------------- #
+
+# The measured problem this exists for: **zero** calls to `mcp__agtmem__*` across
+# 84 transcripts and 11 594 tool calls. Reading was never the bottleneck — the
+# block arrives by itself on two prompts in three. Two things were missing:
+#
+#   1. A reason to *search*. The gate fails silently, so a question the store
+#      cannot answer looks exactly like a question the store has nothing to say
+#      about. That silence is the wasted moment: it is precisely when the agent
+#      should learn that searching is an option.
+#   2. A reason to *write*. Nothing ever asked. Knowledge reached the store only
+#      through the two-hourly distillation of transcripts — delayed and lossy by
+#      construction, and done by a different agent that has to re-derive what the
+#      working agent already knew.
+#
+# Once per conversation, deliberately. A reminder on every prompt stops being read,
+# and the block already carries notes on most prompts.
+NUDGE_STATE = os.path.join(RUNTIME, "agtmem-nudge-state.json")
+NUDGE_MIN_WORDS = MIN_TERMS_FLOOR     # a one-word prompt is not a question
+
+
+def nudge_seen(session_id: str) -> bool:
+    """Has this conversation already been nudged?
+
+    Its own file, its own concern. Kept out of the suppression state on purpose:
+    that file decides *which notes* get injected and has been measured; a nudge
+    counter has no business being able to move those numbers.
+    """
+    try:
+        with open(NUDGE_STATE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    return time.time() - float(data.get(session_key(session_id), 0) or 0) < SESSION_WINDOW
+
+
+def mark_nudge(session_id: str) -> None:
+    """Record the nudge, pruning on the same window the session reminders use."""
+    now = time.time()
+    try:
+        with open(NUDGE_STATE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    data = {k: v for k, v in data.items() if now - float(v or 0) < SESSION_WINDOW}
+    data[session_key(session_id)] = now
+    tmp = NUDGE_STATE + ".tmp"
+    try:
+        os.makedirs(RUNTIME, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, NUDGE_STATE)
+    except (OSError, ValueError):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def build_nudge(cwd: str = "") -> str:
+    """One line, once per conversation: how to search, and how to write.
+
+    Short on purpose. It sits near the top of the block, so every character here
+    is a character a note does not get — and the first version, placed last, was
+    cut by the line-boundary truncation on the very first real block it met
+    (2 596 chars of notes) and would never have been seen at all.
+    """
+    scope = scope_from_cwd(cwd)
+    where = f" Ten katalog to scope `{scope}`." if scope else ""
+    return ("[agtmem] Gdy pytanie dotyczy *dlaczego* — decyzji, przyczyny błędu, "
+            "ustaleń z poprzednich sesji — poszukaj: `agtmem search \"<temat>\"`. "
+            "Gdy ustalicie coś trwałego, zapisz od razu: `agtmem add --id <slug> "
+            "--type decision --title \"...\" --body \"...\"`."
+            f"{where}")
+
+
 def build_context(prompt: str, cwd: str = "", session_id: str = "",
                   transcript: str = "") -> str | None:
     """UserPromptSubmit: return the notes to inject, or None to stay silent."""
@@ -791,7 +873,17 @@ def build_context(prompt: str, cwd: str = "", session_id: str = "",
     log(f"query={query!r} cw={len(found['terms'])}/{len(content_words(prompt))} "
         f"ctx={found['added']} need={need} rows={len(rows)} kept={len(kept)}")
     if not rows or not kept:
-        return None
+        # The gate found nothing. Until now this was silent, which made "the store
+        # has nothing to say" indistinguishable from "the store was never
+        # consulted" — and it is precisely the moment the agent should be told that
+        # searching is an option. Once per conversation; see NUDGE_STATE above.
+        words = content_words(prompt)
+        if len(words) < NUDGE_MIN_WORDS or nudge_seen(session_id):
+            log(f"silent (gate empty) cw={len(words)} nudged={nudge_seen(session_id)}")
+            return None
+        mark_nudge(session_id)
+        log(f"NUDGE gate empty cw={len(words)} sess={short_session(session_id)}")
+        return build_nudge(cwd)
 
     # Scope breaks ties; it does not override relevance. The reorder this replaces
     # put every note from the current directory ahead of every other note with no
@@ -824,6 +916,13 @@ def build_context(prompt: str, cwd: str = "", session_id: str = "",
     if resolve_config()["cite"]:
         lines.append("  Jeśli z którejś korzystasz, dopisz na końcu odpowiedzi "
                      "`[agtmem:<id>]`.")
+    # Third, right behind the cite line and for the same reason: the block is
+    # truncated line by line, so a nudge at the bottom is a nudge that gets cut
+    # whenever the notes are long — which is most of the time.
+    if not nudge_seen(session_id):
+        lines.append(build_nudge(cwd))
+        mark_nudge(session_id)
+        log(f"NUDGE appended to block sess={short_session(session_id)}")
     bodies = 0
     for r in fresh:
         head = f"- {r.get('type')}/{r.get('id')}"
@@ -862,10 +961,31 @@ def build_context(prompt: str, cwd: str = "", session_id: str = "",
     return "\n".join(block_lines)
 
 
-def build_session_context(cwd: str = "", session_id: str = "") -> str | None:
-    """SessionStart: a one-line reminder that the store exists, once per session."""
+def build_session_context(cwd: str = "", session_id: str = "",
+                          source: str = "startup") -> str | None:
+    """SessionStart: the store reminder once per session — or the checkpoint after a
+    compaction.
+
+    The two are deliberately different. The reminder is suppressed for 12 h, because
+    repeating it every session is noise and the block already carries notes on every
+    prompt. The checkpoint is **not** suppressed: it exists precisely because the
+    window just collapsed, so the one moment it must not stay silent is right after
+    that. Before this, `SessionStart(compact)` emitted only the generic reminder —
+    which the 12 h window had usually already silenced.
+    """
     if not session_id:
         return None
+
+    if source == "compact":
+        note = checkpoint_note(session_id)
+        if note:
+            log(f"checkpoint re-injected sess={short_session(session_id)} chars={len(note)}")
+            return ("[agtmem] Kontekst właśnie został sklejony. Stan pracy z chwili przed "
+                    f"kompakcją:\n\n{note}")
+        # Falling through is deliberate: a missing checkpoint must not cost the
+        # reminder as well, or a failed write turns into total silence.
+        log(f"checkpoint missing after compact sess={short_session(session_id)}")
+
     now = time.time()
     state = load_state()
     if now - float(state["sessions"].get(session_id, 0) or 0) < SESSION_WINDOW:
@@ -893,6 +1013,293 @@ def short_session(session_id: str) -> str:
     log is to make `measure_usage.py` possible.
     """
     return (session_id or "-")[:8]
+
+
+# --------------------------------------------------------------------------- #
+# PreCompact — the working set, captured before the window collapses
+# --------------------------------------------------------------------------- #
+
+# Why this exists. The compaction summary is written to *continue a task*, not to
+# remember one: it keeps the shape of the work and drops the specifics — which
+# files were open, what was in flight. Measured on this machine, emergency
+# compaction fires at 84-89% of the window, and until now the only thing that
+# knew the working set was the transcript, read after the fact by a poller.
+#
+# `PreCompact` is the one hook whose stdout does **not** land in the chat: it
+# becomes `session.hookContexts.preCompactInstructions` and is consumed by the
+# compaction step itself. So this handler does two separate things — writes a
+# note (durable, searchable) and prints an instruction (steers the summary).
+CHECKPOINT_PREFIX = "checkpoint-"
+CHECKPOINT_TYPE = "log"
+CHECKPOINT_TIMEOUT = 12.0
+CHECKPOINT_FILES_MAX = 14
+CHECKPOINT_ASKS_MAX = 5
+CHECKPOINT_ASK_CHARS = 180
+CHECKPOINT_NOTE_CHARS = 2000
+# Deliberately much larger than TRANSCRIPT_TAIL_BYTES, and measured rather than
+# guessed. 200 kB is tuned for `build_query`, which wants the *freshest* words. A
+# working set wants the *session*: in a 1.3 MB agentic transcript the last 200 kB
+# held **five assistant records and not one user record** — a long turn emits
+# hundreds of tool records between two asks, so the asks sit far behind the tail.
+# The first version of this function therefore wrote checkpoints with a file list
+# and no asks at all, and looked like it had worked.
+CHECKPOINT_TAIL_BYTES = 4_000_000
+# Not every `role: user` record is an ask. The app appends scaffolding turns —
+# `<system-reminder data-role="error-recovery">…</system-reminder>` and the like —
+# and the first run of this function stored one of them as a question Milosz had
+# asked. Strip the block, then require something to be left.
+SYSTEM_BLOCK_RE = re.compile(r"<system-reminder\b.*?</system-reminder>", re.S)
+# Only tools that change a file. `Read` is deliberately absent: a session reads
+# dozens of files it never touches, and a working set that lists them says
+# nothing about what was being worked on.
+WRITE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit", "NotebookWrite"})
+
+
+def _run_cli(args: list[str], timeout: float) -> tuple[int, str]:
+    """Run the agtmem CLI exactly the way `search` does — same interpreter, same store.
+
+    Kept separate from `search` rather than folded into it: `search` has its own
+    gate-tuned timeout and argument set, and rewriting a path that is already
+    measured is how a working thing stops working.
+    """
+    cfg = resolve_config()
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    if cfg["store"]:
+        env["AGTMEM_HOME"] = cfg["store"]
+    cmd = [cfg["python"], "-m", "agtmem", *args]
+    cwds = _cwd_candidates(cfg["repo"])
+    if cfg["repo"] is None:
+        cwds.append(guess_repo())
+    for cwd in cwds:
+        try:
+            proc = subprocess.run(cmd, cwd=cwd, env=env,
+                                  capture_output=True, timeout=timeout)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            log(f"cli failed: {exc!r} cwd={cwd!r}")
+            continue
+        if proc.returncode == 0:
+            return 0, proc.stdout.decode("utf-8", "replace")
+        log(f"cli rc={proc.returncode} argv={args[:2]} cwd={cwd!r} "
+            f"err={proc.stderr.decode('utf-8', 'replace')[:160]!r}")
+    return 1, ""
+
+
+def checkpoint_id(session_id: str) -> str | None:
+    """One checkpoint per conversation, refreshed in place on each compaction.
+
+    Derived from the session id rather than stored, so `SessionStart` can find it
+    again after a compaction even if the hook's own state file was pruned or lost.
+    """
+    short = re.sub(r"[^0-9a-zA-Z]", "", session_id or "")[:8].lower()
+    return f"{CHECKPOINT_PREFIX}{short}" if short else None
+
+
+def working_set(path: str) -> dict:
+    """Files written and asks made, from the transcript tail. Never the whole file.
+
+    Same reading discipline as `recent_context`: an 18 MB transcript is normal
+    here and a hook has milliseconds.
+    """
+    out: dict = {"files": [], "asks": []}
+    if not path or not os.path.isfile(path):
+        return out
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - CHECKPOINT_TAIL_BYTES))
+            raw = fh.read()
+    except OSError:
+        return out
+
+    lines = raw.split(b"\n")
+    if size > CHECKPOINT_TAIL_BYTES:
+        lines = lines[1:]        # the first line is a truncated record, not JSON
+    files: list[str] = []
+    asks: list[str] = []
+    for line in lines:
+        # Cheap pre-filter before the JSON parse. At 4 MB this is thousands of
+        # records and almost all of them are tool traffic this function never
+        # looks at; parsing them all costs the compaction window for nothing.
+        if b"function_call" not in line and b"user" not in line:
+            continue
+        try:
+            rec = json.loads(decode_payload(line))
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        kind = rec.get("type")
+        if kind == "function_call":
+            if rec.get("name") not in WRITE_TOOLS:
+                continue
+            argv = rec.get("arguments")
+            if isinstance(argv, str):
+                try:
+                    argv = json.loads(argv)
+                except ValueError:
+                    continue
+            fp = argv.get("file_path") if isinstance(argv, dict) else None
+            if isinstance(fp, str) and fp.strip() and fp not in files:
+                files.append(fp.strip())
+        elif kind == "message" and rec.get("role") == "user":
+            content = rec.get("content")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "\n".join(b.get("text", "") for b in content
+                                 if isinstance(b, dict) and isinstance(b.get("text"), str))
+            else:
+                continue
+            quoted = USER_QUERY_RE.search(text)   # a user turn carries injected context
+            if quoted:
+                text = quoted.group(1)
+            text = " ".join(SYSTEM_BLOCK_RE.sub(" ", text).split())
+            # No `<user_query>` and the leftovers are still markup: not an ask.
+            if not quoted and text.lstrip().startswith("<"):
+                continue
+            if text and text not in asks:
+                asks.append(text)
+
+    # The file runs oldest-first; a working set is read freshest-first.
+    out["files"] = list(reversed(files))[:CHECKPOINT_FILES_MAX]
+    out["asks"] = [tidy(a, CHECKPOINT_ASK_CHARS) for a in reversed(asks)][:CHECKPOINT_ASKS_MAX]
+    return out
+
+
+def build_checkpoint(payload: dict) -> str | None:
+    """PreCompact: persist the working set, and tell the compaction to keep it.
+
+    Returns the text that becomes `preCompactInstructions`, or None to stay silent.
+    """
+    session_id = str(payload.get("session_id") or "")
+    transcript = str(payload.get("transcript_path") or "")
+    cwd = str(payload.get("cwd") or "")
+    trigger = str(payload.get("trigger") or "auto")
+    nid = checkpoint_id(session_id)
+    ws = working_set(transcript)
+    if not nid or (not ws["files"] and not ws["asks"]):
+        log(f"checkpoint skipped id={bool(nid)} files={len(ws['files'])} "
+            f"asks={len(ws['asks'])}")
+        return None
+
+    scope = scope_from_cwd(cwd) or "global"
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    lines = [f"Stan pracy przed kompakcją ({trigger}), {stamp}."]
+    if ws["files"]:
+        lines += ["", "## Pliki dotknięte w tej sesji"]
+        lines += [f"- `{f}`" for f in ws["files"]]
+    if ws["asks"]:
+        lines += ["", "## O co pytał Milosz (od najnowszego)"]
+        lines += [f"- {a}" for a in ws["asks"]]
+    body = "\n".join(lines)[:CHECKPOINT_NOTE_CHARS]
+
+    tmp = os.path.join(RUNTIME, "checkpoint.md")
+    try:
+        os.makedirs(RUNTIME, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(body)
+    except OSError as exc:
+        log(f"checkpoint body not written: {exc!r}")
+        return None
+
+    # Every field is passed on purpose. `--update` replaces the note wholesale, so
+    # a field left out is a field silently dropped — the trap already recorded in
+    # the store as `update wymaga wszystkich pól`.
+    rc, _ = _run_cli(
+        ["add", "--id", nid, "--type", CHECKPOINT_TYPE, "--scope", scope,
+         "--title", f"Kontrolny punkt sesji {nid[len(CHECKPOINT_PREFIX):]}",
+         "--body-file", tmp, "--tags", "checkpoint", "sesja", "kompakcja",
+         "--origin", "tool", "--detail", f"PreCompact trigger={trigger}", "--update"],
+        CHECKPOINT_TIMEOUT)
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    if rc != 0:
+        log(f"checkpoint NOT stored id={nid}")
+        return None
+    log(f"checkpoint stored id={nid} scope={scope} files={len(ws['files'])} "
+        f"asks={len(ws['asks'])} body={len(body)}c")
+
+    names = ", ".join(f"`{os.path.basename(f)}`" for f in ws["files"][:6]) or "brak"
+    return ("[agtmem] Przed kompakcją: kontrolny punkt sesji zapisany jako notatka "
+            f"`{nid}` (`agtmem show {nid}`). W streszczeniu zachowaj ścieżki plików "
+            f"i otwarte pytania — pliki w tej sesji: {names}. "
+            "Do pamięci projektu sięgaj przez `agtmem search \"<temat>\"`.")
+
+
+def checkpoint_note(session_id: str) -> str | None:
+    """The checkpoint written just before the compaction that is now finishing."""
+    nid = checkpoint_id(session_id)
+    if not nid:
+        return None
+    rc, out = _run_cli(["show", nid], SEARCH_TIMEOUT)
+    if rc != 0:
+        return None
+    text = FRONTMATTER_RE.sub("", out).strip()
+    return text[:CHECKPOINT_NOTE_CHARS] or None
+
+
+# --- ingest right after the session ------------------------------------------
+# The distillation pass runs every two hours, which leaves a window where a
+# conversation that has just ended is not in the store at all — and the hook
+# that would search for it runs at the *start* of the next session, i.e. inside
+# that window. `SessionEnd` closes it: the transcript is imported the moment the
+# conversation stops. `SessionStart` is only a catch-up, for the runs where the
+# app was killed rather than closed and no `SessionEnd` ever fired.
+INGEST_STATE = os.path.join(RUNTIME, "agtmem-ingest-state.json")
+INGEST_TIMEOUT = 20.0          # the hook's own timeout is set a few seconds above
+INGEST_LIMIT = 6               # notes per run; a backfill must not eat the window
+INGEST_CATCHUP_AFTER = 900.0   # seconds; how stale the last run may be at startup
+
+
+def _ingest_last() -> float:
+    try:
+        with open(INGEST_STATE, encoding="utf-8") as fh:
+            return float(json.load(fh).get("last") or 0.0)
+    except (OSError, ValueError, TypeError):
+        return 0.0
+
+
+def _mark_ingest(now: float) -> None:
+    tmp = INGEST_STATE + ".tmp"
+    try:
+        os.makedirs(RUNTIME, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"last": now}, fh)
+        os.replace(tmp, INGEST_STATE)
+    except OSError as exc:
+        log(f"ingest stamp not written: {exc!r}")
+
+
+def ingest_after_session(event: str) -> None:
+    """Import the session that just ended, before the two-hour pass reaches it.
+
+    Writes nothing to stdout. `SessionEnd` has no consumer for hook output, and a
+    stray line there would land in the transcript rather than in the model's
+    context — the same silent-nothing that made the first `PreCompact` attempt
+    look like a success.
+
+    The catch-up is throttled on purpose: the one moment a user is waiting on
+    this hook is when the window is opening, and the first `--new-only` run has
+    no watermark yet, so it pays the full scan.
+    """
+    now = time.time()
+    if event == "SessionStart" and now - _ingest_last() < INGEST_CATCHUP_AFTER:
+        log("ingest catch-up not due")
+        return
+    # Claim the slot before the run, not after: `SessionEnd` and a following
+    # `SessionStart` are close enough together to both pass the check above.
+    _mark_ingest(now)
+    rc, out = _run_cli(
+        ["ingest-sessions", "--new-only", "--limit", str(INGEST_LIMIT)],
+        INGEST_TIMEOUT)
+    if rc != 0:
+        log(f"ingest failed event={event}")
+        return
+    log(f"ingest event={event} {tidy(out, 160)}")
 
 
 def selfcheck() -> int:
@@ -946,17 +1353,40 @@ def main() -> int:
     session_id = str(payload.get("session_id") or "")
     transcript = str(payload.get("transcript_path") or "")
 
+    catchup = False
     try:
         if event == "SessionStart":
-            context = build_session_context(cwd, session_id)
+            context = build_session_context(cwd, session_id,
+                                            str(payload.get("source") or "startup"))
+            catchup = True
         elif event == "UserPromptSubmit":
             context = build_context(prompt, cwd, session_id, transcript)
+        elif event == "PreCompact":
+            context = build_checkpoint(payload)
+        elif event == "SessionEnd":
+            # Nothing to say to anyone here — the payload has no reader. The
+            # work is the side effect: the transcript stops being a file only
+            # the two-hour pass knows about.
+            ingest_after_session(event)
+            return 0
         else:
             log(f"ignored event={event}")
             return 0
     except Exception as exc:                      # noqa: BLE001 - must never raise
         log(f"ERROR {event} raised: {exc!r} sess={short_session(session_id)} "
             f"prompt={prompt[:60]!r}")
+        return 0
+
+    # PreCompact is the one event that does NOT take the JSON envelope: the CLI
+    # reads its stdout straight into `hookContexts.preCompactInstructions`, which
+    # the compaction step consumes. Wrapping it would feed the summariser a JSON
+    # blob instead of an instruction.
+    if event == "PreCompact":
+        if context:
+            sys.stdout.write(context)
+            log(f"PRECOMPACT {len(context)}c sess={short_session(session_id)}")
+        else:
+            log(f"silent event=PreCompact sess={short_session(session_id)}")
         return 0
 
     if context:
@@ -968,6 +1398,11 @@ def main() -> int:
     else:
         log(f"silent event={event} sess={short_session(session_id)} "
             f"prompt={prompt[:60]!r}")
+    # After the injection, never before: the catch-up scan is the slow part and
+    # the injection is what the user is actually waiting on. It runs last for a
+    # reason — the notes it imports are for the *next* search, not this one.
+    if catchup:
+        ingest_after_session("SessionStart")
     return 0
 
 

@@ -35,6 +35,9 @@ MEM_HOME = _resolve_home()
 INDEX_PATH = MEM_HOME / ".index.sqlite"
 LOCK_PATH = MEM_HOME / ".lock"
 EVAL_PATH = MEM_HOME / "eval.txt"
+# When the last incremental `ingest-sessions --new-only` scan started. Kept beside
+# the index and, like it, disposable: delete it and the next scan is a full one.
+INGEST_STATE = MEM_HOME / ".ingest-state.json"
 
 TYPES = ("fact", "decision", "bug", "candidate", "anatomy", "project", "session", "log")
 ORIGINS = ("user", "agent", "tool", "import", "shared")

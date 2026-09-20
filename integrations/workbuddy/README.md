@@ -4,13 +4,15 @@
 no hooks of its own (`docs/ARCHITECTURE.md`). Reading the store at the right
 moment is the *consumer's* job — and this directory is one consumer's answer.
 
-WorkBuddy spawns the CodeBuddy CLI, and that CLI has a hook system. Two events
-are enough:
+WorkBuddy spawns the CodeBuddy CLI, and that CLI has a hook system. Four events
+are used:
 
 | Event | What it does |
 | --- | --- |
 | `UserPromptSubmit` | searches the store with the prompt's content words and appends the best hits to the context, before the model sees the prompt |
-| `SessionStart` | a one-line reminder that the store exists, once per session |
+| `SessionStart` | a one-line reminder that the store exists, once per session — or, after a compaction, the working set captured just before it |
+| `PreCompact` | writes a checkpoint note and tells the compaction what to keep, so the summary does not drop the files and the open questions |
+| `SessionEnd` | imports the transcript that just stopped being written, so the next session can search it — instead of waiting up to two hours for the distillation pass |
 
 The result is that a question about *why* — a decision, a bug's cause, something
 settled in an earlier session — arrives with the relevant note already attached,
@@ -197,6 +199,117 @@ so it is the conversation that gets an injection **most reliably** (4 of 4 runs)
 and the injection is worthless there. Lexical proximity is anti-correlated with
 "needs recall" in exactly the two cases that matter most.
 
+## The working set: what `PreCompact` adds
+
+`PreCompact` is the one hook whose stdout does **not** land in the chat. The CLI
+reads it into `session.hookContexts.preCompactInstructions`, which the compaction
+step itself consumes — so it steers what the summary keeps. That is a different
+power from `additionalContext`, and it is the right one for state that must
+survive the window collapsing.
+
+The handler does two things at that moment:
+
+1. **Writes a checkpoint note** (`log/checkpoint-<first 8 of the session id>`,
+   refreshed in place on each compaction) holding the files this session actually
+   changed and the last few asks. Only `Edit`/`Write`/`MultiEdit` count as
+   "changed" — a session reads dozens of files it never touches, and a working set
+   that lists them says nothing about what was being worked on.
+2. **Prints an instruction** naming the note and the files, so the summary keeps
+   the paths and the open questions instead of only the shape of the work.
+
+`SessionStart` with `source: compact` then reads that note back and injects it. The
+two halves are a pair; either one alone is half a mechanism.
+
+⚠️ **The reminder's once-per-session suppression is bypassed here on purpose.**
+`SessionStart` normally stays silent for 12 h after its first reminder, which would
+have silenced exactly the one event that must not be silent: the moment right after
+the window collapsed.
+
+### Two things that looked like success and were not
+
+- **The first version read 200 kB of transcript and produced no asks at all.** In a
+  1.3 MB agentic transcript the last 200 kB held **five assistant records and not
+  one user record** — a long turn emits hundreds of tool records between two asks.
+  The checkpoint still looked healthy: a file list, no questions, exit 0.
+  `TRANSCRIPT_TAIL_BYTES` is tuned for `build_query`, which wants the *freshest*
+  words; a working set wants the *session*, so it reads `CHECKPOINT_TAIL_BYTES`
+  (4 MB) instead.
+- **`role: user` is not the same as "the user asked something".** The app appends
+  scaffolding turns, and the first run stored a
+  `<system-reminder data-role="error-recovery">` block as a question Milosz had asked.
+
+## The nudge: the only channel that can ask the agent to use the store
+
+The measured starting point was **zero** calls to `mcp__agtmem__*` across 84
+transcripts and 11 594 tool calls. Reading was never the bottleneck — the block
+arrives by itself on roughly two prompts in three. Two things were missing, and both
+are now asked for in the block itself, **once per conversation**:
+
+- **A reason to search.** The gate used to fail silently, which made "the store has
+  nothing to say" indistinguishable from "the store was never consulted" — and that
+  is precisely the moment the agent should learn that searching is an option. On a
+  failed gate with at least `MIN_TERMS_FLOOR` content words, the nudge is emitted
+  *alone*, so it is the only thing in the block.
+- **A reason to write.** Nothing had ever asked. Knowledge reached the store only
+  through the two-hourly distillation of transcripts — delayed and lossy by
+  construction, and done by a different agent that has to re-derive what the working
+  agent already knew.
+
+The nudge sits **third in the block**, right behind the citation line. Placed last,
+it was cut by the line-boundary truncation on the first real block it met (2 596
+characters of notes) and would never have been seen at all.
+
+It keeps its own state file rather than joining the suppression state: that file
+decides *which notes* get injected and has been measured, and a nudge counter has no
+business being able to move those numbers.
+
+## Ingest immediately, not two hours later
+
+The distillation pass runs every two hours, and the window it leaves is exactly
+where the damage is: a conversation ends, the next one starts, and the hook that
+searches for it searches **before** the transcript has been imported. The note that
+would have answered the first question of the new session did not exist when the
+question was asked.
+
+`SessionEnd` closes it — the transcript is imported the moment the conversation
+stops. `SessionStart` is a throttled catch-up (15 min) for the runs where the app
+was killed rather than closed and no `SessionEnd` ever fired, and it runs **after**
+the injection, never before: the injection is what the user is waiting on, and the
+notes the catch-up imports are for the *next* search anyway.
+
+The cost is the whole design problem. A full scan measured **7.3 s** cold, and the
+`reindex()` it used to trigger measured **11.5 s** on its own — 18.2 s of hook, on
+the path where the user is waiting for a window to open. Two changes bring it down:
+
+| | cold (no watermark, 131 transcripts) | one fresh transcript (25 MB) | nothing new |
+| --- | --- | --- | --- |
+| `ingest-sessions`, full scan | 6.7 s | — | — |
+| `reindex()` after it | 11.5 s | 11.5 s | — |
+| **now**: `--new-only` + `refresh()` | **7.3 s** | **0.76 s** | **0.40 s** |
+
+* **`--new-only`** — the watermark in `.ingest-state.json` is `scan_started − 2 s`,
+  and `iter_compactions` skips unread every transcript whose mtime is at or below
+  it. A compaction summary is appended to the transcript as it is produced, so a
+  file untouched since the last scan cannot hold a new one. The two-second margin
+  is what keeps a file written *during* the scan from being missed: it lands above
+  the watermark and is re-read next time. The watermark advances only on a clean
+  run — not a dry one, and not one that hit `--limit`.
+* **`index.refresh()`** — re-reads a note only when its file's mtime differs from
+  the mtime recorded in the index. 0.16 s for one changed note against 11.5 s for a
+  full rebuild. It also drops index rows for note files that no longer exist, which
+  `reindex()` got for free and an incremental pass has to do explicitly.
+
+`--new-only` is for hooks. It is **not** the backlog count — `--dry-run` without it
+is, because that still reads everything.
+
+The hook passes an explicit `--limit 6` so a pending backfill cannot eat the window;
+the budget is deliberately small, and the backlog drains a few notes per session.
+The hook timeout is 30 s for `SessionEnd` and `SessionStart` against 20 s for the
+injection events, because the import runs inside the hook and is allowed 20 s of its
+own — killing the hook mid-import corrupts nothing (notes are written one at a time
+and the watermark only advances on a clean finish), but it would silently stop the
+import from ever completing.
+
 ## Runtime files
 
 The log and the suppression state are **not** written beside this script. The
@@ -209,6 +322,13 @@ sidecar, overridable with `AGTMEM_HOOK_RUNTIME`.
 | --- | --- |
 | `agtmem-inject.log` | one line per event: the query, the gate decision, the session, the ids injected |
 | `agtmem-inject-state.json` | repeat suppression, keyed per conversation |
+| `agtmem-nudge-state.json` | which conversations have already had the nudge, pruned on the same 12 h window |
+| `agtmem-ingest-state.json` | when the hook last ran the incremental import, so the `SessionStart` catch-up can be throttled |
+
+One more file, and it lives in the **store** rather than here: `.ingest-state.json`
+holds the ingest watermark. It belongs to the store because `ingest-sessions` is a
+store command — the hook is only one of its callers, and a watermark kept in the
+runtime directory would reset the scan every time that directory moved.
 
 The log is the only way to see what the hook decided, because its stdout goes
 into the conversation context rather than to a terminal. Read it as a funnel:
