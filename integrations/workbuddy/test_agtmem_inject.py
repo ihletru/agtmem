@@ -977,6 +977,94 @@ def main() -> int:
           hook.build_context(long_prompt, session_id="cap-test") is not None,
           f"need would be {hook.required_terms(hook.content_words(long_prompt))}")
 
+    print("\n--- the checkpoint survives PreCompact not firing ---")
+    # Measured 2026-09-22, and this is why the checks exist: `PreCompact` does not
+    # fire in production on this machine. The hook's own log holds 376
+    # `UserPromptSubmit` lines and **zero** `PreCompact` lines across 09-19 → 09-22,
+    # and a real compaction (09-21 07:12:12) spawns no 20 s hook at all — only the
+    # `SessionStart` one at 30 s, 42 s later, which then logged `checkpoint missing
+    # after compact` four times in three hours. The note was never written, so it
+    # cannot be a dependency. These pin the fallback that replaced it.
+    fresh()
+    tmp_transcript = os.path.join(RUNTIME_TMP, "transcript.jsonl")
+    with open(tmp_transcript, "w", encoding="utf-8") as fh:
+        for rec in (
+            {"type": "function_call", "name": "Read",
+             "arguments": json.dumps({"file_path": "/tmp/never-touched.py"})},
+            {"type": "function_call", "name": "Edit",
+             "arguments": json.dumps({"file_path": "/srv/verbigem/android/Main.kt"})},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text",
+                          "text": "<user_query>napraw kompresje w hooku</user_query>"}]},
+        ):
+            fh.write(json.dumps(rec) + "\n")
+
+    ws = hook.working_set(tmp_transcript)
+    check("working_set keeps the file that was written",
+          ws["files"] == ["/srv/verbigem/android/Main.kt"], str(ws["files"]))
+    check("working_set drops the file that was only read",
+          "/tmp/never-touched.py" not in ws["files"], str(ws["files"]))
+    check("working_set lifts the ask out of <user_query>",
+          ws["asks"] == ["napraw kompresje w hooku"], str(ws["asks"]))
+
+    # `zzzz0000` has no checkpoint note in the store — the production case.
+    ctx = hook.build_session_context("/srv/verbigem/android", "zzzz0000", "compact",
+                                     tmp_transcript)
+    check("a missing note does not silence the post-compaction block",
+          ctx is not None, repr(ctx))
+    check("the fallback names the file that was written",
+          bool(ctx) and "Main.kt" in ctx, repr(ctx)[:200])
+    check("the fallback names the open ask",
+          bool(ctx) and "napraw kompresje" in ctx, repr(ctx)[:200])
+    body = hook.render_working_set(ws, "odtworzone z transkryptu")
+    check("the fallback renders through the same function as the note path",
+          bool(ctx) and body in ctx, repr(body)[:160])
+    # Negative control: with neither a note nor a readable transcript the function
+    # must still fall through to the reminder. Silence here would hide the failure.
+    check("with neither note nor transcript it still returns the reminder",
+          hook.build_session_context("/srv/verbigem/android", "zzzz0001", "compact",
+                                     os.path.join(RUNTIME_TMP, "absent.jsonl")) is not None)
+
+    # Process level, and this half is the point. The checks above call the function
+    # directly, which is exactly the class of test that missed the original defect:
+    # a function can be perfect while the event that would call it never fires. Only
+    # stdin -> stdout through the real script exercises the dispatch table.
+    #
+    # Both calls get an isolated store. `SessionStart` also triggers the ingest
+    # catch-up and `PreCompact` writes a note, so inheriting the environment would
+    # mean a test run writing into the live store — the same mistake that once let an
+    # ad-hoc call silence a real prompt.
+    iso_env = {**os.environ, "AGTMEM_HOME": os.path.join(RUNTIME_TMP, "iso-store")}
+    fresh()
+    rc, out, _err = run_process(json.dumps({
+        "hook_event_name": "SessionStart", "source": "compact",
+        "session_id": "zzzz0000", "cwd": "/srv/verbigem/android",
+        "transcript_path": tmp_transcript}), timeout=60.0, env=iso_env)
+    check("SessionStart(compact) exits 0 through the real process", rc == 0, f"rc={rc}")
+    try:
+        parsed = json.loads(out)
+        got = parsed["hookSpecificOutput"]
+        block = got.get("additionalContext") or ""
+        check("the process emits the derived checkpoint, not silence",
+              "Main.kt" in block and "napraw kompresje" in block, repr(block)[:220])
+        check("the process names the event it is answering",
+              got.get("hookEventName") == "SessionStart", out[:140])
+    except (ValueError, KeyError, TypeError) as exc:
+        check("SessionStart(compact) stdout parses", False, repr(exc))
+
+    # The `PreCompact` branch is dead in production here (see the note above), so what
+    # is worth pinning is not that it runs but that its *output shape* is right for the
+    # day it does: the CLI reads that stdout raw into `preCompactInstructions`, so a
+    # JSON envelope there would feed the summariser a blob instead of an instruction.
+    # Silent is a valid answer; wrapped is not. A grep for the event name would pass
+    # on a dead branch, which is why this asserts behaviour instead.
+    rc, out, _err = run_process(json.dumps({
+        "hook_event_name": "PreCompact", "trigger": "auto",
+        "session_id": "zzzz0000", "cwd": "/srv/verbigem/android",
+        "transcript_path": tmp_transcript}), timeout=60.0, env=iso_env)
+    check("PreCompact exits 0 and never wraps its stdout in the JSON envelope",
+          rc == 0 and not out.strip().startswith("{"), f"rc={rc} out={out[:140]!r}")
+
     print("\n--- latency ---")
     fresh()
     t = time.perf_counter()

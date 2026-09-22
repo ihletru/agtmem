@@ -225,6 +225,38 @@ two halves are a pair; either one alone is half a mechanism.
 have silenced exactly the one event that must not be silent: the moment right after
 the window collapsed.
 
+### ⚠️ Measured 2026-09-22: `PreCompact` does not fire here, so the note is a bonus
+
+The pair above is wired correctly and **still does not run on this machine**. The
+evidence, all of it from the machine rather than from the code:
+
+| what was checked | what it read |
+| --- | --- |
+| hook's own log, 09-19 → 09-22 | 376 `UserPromptSubmit` lines, **0 `PreCompact` lines** |
+| the CLI bundle | `executePreCompactHooks` ×2, `preCompactInstructions` ×4 — **implemented** |
+| desktop log, a real compaction (09-21 07:12:12) | no hook spawned at 20 s; the only spawn is the `SessionStart` one at 30 s, **42 s later** |
+| what that late hook then logged | `checkpoint missing after compact` — ×4 in three hours |
+
+So the event exists, the registration exists, and the handler never runs for the
+compaction that actually happens (`compactType=emergency-auto → strategy: MaxToken`).
+The note was therefore **never written in production** — it only ever appeared in an
+ad-hoc run on 09-20, which is also why the defect survived: `checkpoint` had **zero
+occurrences** in the test suite, so nothing was watching.
+
+The mechanism now survives the event instead of depending on it. Compaction rewrites
+the *window*, not the transcript, so `SessionStart(source=compact)` rebuilds the same
+working set from the transcript when the note is absent — through the same
+`render_working_set()` the note path uses, so the two cannot drift. The log says which
+path ran (`checkpoint re-injected` vs `checkpoint derived`), because "the note worked"
+must never have to be assumed. Eight checks in `test_agtmem_inject.py` pin it,
+including a negative control: with neither a note nor a readable transcript the
+function still falls through to the reminder rather than going silent.
+
+**The general rule this is an instance of:** a hook whose output is a *side effect*
+needs its absence to be detectable. `PreCompact` returned `None` on failure and wrote
+nothing to the chat, so a mechanism that had never once executed looked exactly like
+one that worked. Assert the effect where it lands, not where it is emitted.
+
 ### Two things that looked like success and were not
 
 - **The first version read 200 kB of transcript and produced no asks at all.** In a

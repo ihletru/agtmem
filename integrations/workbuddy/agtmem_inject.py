@@ -962,7 +962,8 @@ def build_context(prompt: str, cwd: str = "", session_id: str = "",
 
 
 def build_session_context(cwd: str = "", session_id: str = "",
-                          source: str = "startup") -> str | None:
+                          source: str = "startup",
+                          transcript: str = "") -> str | None:
     """SessionStart: the store reminder once per session — or the checkpoint after a
     compaction.
 
@@ -982,6 +983,18 @@ def build_session_context(cwd: str = "", session_id: str = "",
             log(f"checkpoint re-injected sess={short_session(session_id)} chars={len(note)}")
             return ("[agtmem] Kontekst właśnie został sklejony. Stan pracy z chwili przed "
                     f"kompakcją:\n\n{note}")
+        # The note is absent in production, because `PreCompact` does not fire here
+        # (see `build_checkpoint`). Compaction rewrites the *window*, not the
+        # transcript, so the working set is still on disk and is recovered from
+        # there. Same renderer, one dependency fewer — and the log says which of
+        # the two paths ran, so "the note worked" never has to be assumed.
+        ws = working_set(transcript)
+        if ws["files"] or ws["asks"]:
+            body = render_working_set(ws, "odtworzone z transkryptu")
+            log(f"checkpoint derived sess={short_session(session_id)} "
+                f"files={len(ws['files'])} asks={len(ws['asks'])} chars={len(body)}")
+            return ("[agtmem] Kontekst właśnie został sklejony. Stan pracy odtworzony "
+                    f"z transkryptu:\n\n{body}")
         # Falling through is deliberate: a missing checkpoint must not cost the
         # reminder as well, or a failed write turns into total silence.
         log(f"checkpoint missing after compact sess={short_session(session_id)}")
@@ -1168,10 +1181,40 @@ def working_set(path: str) -> dict:
     return out
 
 
+def render_working_set(ws: dict, trigger: str, stamp: str | None = None) -> str:
+    """The checkpoint body, from a working set — shared by both producers.
+
+    Two callers render this text now: `build_checkpoint` (PreCompact, which also
+    persists it as a note) and the post-compaction fallback in
+    `build_session_context`. They must not drift apart. The fallback exists
+    precisely because the note is often absent, and a fallback that rendered a
+    different body would be a second mechanism to debug rather than a safety net.
+    """
+    stamp = stamp or time.strftime("%Y-%m-%d %H:%M")
+    lines = [f"Stan pracy przed kompakcją ({trigger}), {stamp}."]
+    if ws["files"]:
+        lines += ["", "## Pliki dotknięte w tej sesji"]
+        lines += [f"- `{f}`" for f in ws["files"]]
+    if ws["asks"]:
+        lines += ["", "## O co pytał Milosz (od najnowszego)"]
+        lines += [f"- {a}" for a in ws["asks"]]
+    return "\n".join(lines)[:CHECKPOINT_NOTE_CHARS]
+
+
 def build_checkpoint(payload: dict) -> str | None:
     """PreCompact: persist the working set, and tell the compaction to keep it.
 
     Returns the text that becomes `preCompactInstructions`, or None to stay silent.
+
+    ⚠️ **Measured 2026-09-22: this event does not fire in production here.** The
+    CLI bundle implements it (`executePreCompactHooks`, `preCompactInstructions`)
+    and the registration is present, yet across 2026-09-19 → 09-22 the hook's own
+    log holds 376 `UserPromptSubmit` lines and **zero** `PreCompact` lines, and
+    the desktop log for an actual compaction (2026-09-21 07:12:12) spawns no
+    process at 20 s — only the `SessionStart` one at 30 s, 42 s later, which then
+    reports `checkpoint missing after compact`. So the durable note is a bonus
+    when it happens and never a dependency: the working set is recovered from the
+    transcript instead. See `build_session_context`.
     """
     session_id = str(payload.get("session_id") or "")
     transcript = str(payload.get("transcript_path") or "")
@@ -1185,15 +1228,7 @@ def build_checkpoint(payload: dict) -> str | None:
         return None
 
     scope = scope_from_cwd(cwd) or "global"
-    stamp = time.strftime("%Y-%m-%d %H:%M")
-    lines = [f"Stan pracy przed kompakcją ({trigger}), {stamp}."]
-    if ws["files"]:
-        lines += ["", "## Pliki dotknięte w tej sesji"]
-        lines += [f"- `{f}`" for f in ws["files"]]
-    if ws["asks"]:
-        lines += ["", "## O co pytał Milosz (od najnowszego)"]
-        lines += [f"- {a}" for a in ws["asks"]]
-    body = "\n".join(lines)[:CHECKPOINT_NOTE_CHARS]
+    body = render_working_set(ws, trigger)
 
     tmp = os.path.join(RUNTIME, "checkpoint.md")
     try:
@@ -1357,7 +1392,8 @@ def main() -> int:
     try:
         if event == "SessionStart":
             context = build_session_context(cwd, session_id,
-                                            str(payload.get("source") or "startup"))
+                                            str(payload.get("source") or "startup"),
+                                            transcript)
             catchup = True
         elif event == "UserPromptSubmit":
             context = build_context(prompt, cwd, session_id, transcript)
