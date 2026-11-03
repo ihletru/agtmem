@@ -22,8 +22,12 @@ jobs:
         # platform branch (`msvcrt` vs `fcntl`), and every lock bug found during
         # development was Windows-only. Testing Linux alone would leave the
         # branch that actually broke untested.
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ["3.10", "3.13"]
+        # ⚠️ Pełna matryca (Windows + macOS) tylko ręcznie — `workflow_dispatch`.
+        # Decyzja Milosza 3.11.2026: push ma dawać tani sygnał, a nie palić sześciu
+        # maszyn przy każdej zmianie. Windows i macOS zostają w matrycy, bo blokada
+        # magazynu ma gałąź `msvcrt`/`fcntl` — ale uruchamia się je świadomie.
+        os: ${{ github.event_name == 'workflow_dispatch' && fromJSON('["ubuntu-latest","windows-latest","macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
+        python: ${{ github.event_name == 'workflow_dispatch' && fromJSON('["3.10","3.13"]') || fromJSON('["3.13"]') }}
 
     steps:
       - uses: actions/checkout@v4
